@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pyogrio.errors import DataLayerError, DataSourceError
 
 import charts
+import navwarnings
 import sync
 import tides
 
@@ -60,6 +61,11 @@ def compile_upload(file: UploadFile):
             return Response(charts.compile_cell(path), media_type="application/octet-stream")
         except UNREADABLE:
             raise HTTPException(422, f"{name} isn't a readable S-57 cell")
+
+
+@app.get("/api/warnings")
+def get_warnings():
+    return navwarnings.current()
 
 
 @app.get("/api/status")

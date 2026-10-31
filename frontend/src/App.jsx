@@ -1,10 +1,11 @@
 import { COORDINATE_SYSTEM, CompositeLayer, Layer, project32 } from '@deck.gl/core'
+import { PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
 import { MapboxOverlay } from '@deck.gl/mapbox'
 import { Geometry, Model } from '@luma.gl/engine'
 import { VectorTile } from '@mapbox/vector-tile'
 import maplibregl from 'maplibre-gl'
 import { PbfReader } from 'pbf'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
 const OCEAN = '#081e42'
@@ -33,6 +34,35 @@ const CUBE_FACES = [
 const OUTLINE_ZOOM = 8 // closer than this, the charts' coasts take over from the world's outline
 const NO_ENC_ZOOM = 5 // from here in, a view with no ENC at all says so
 const SEARCH_ZOOM = 14 // a place found is shown no closer than this
+const CLOCK = 60000 // ms: how often the sun moves
+const WARNINGS_REFRESH = 3600000 // ms
+const WARNING_FILL = 28 // of 255: very see-through
+const WARNING_FILL_PICKED = 80
+const WARNING_EDGE = 170
+const WARNING_HEIGHT = 24 // px: a box this tall stays visible from far out, where true scale would make it nothing
+const WARNING_DOT = 5 // px: the size of a warning with no size of its own, and it's bigger once picked
+const WARNING_DOT_PICKED = 8
+const WARNING_DOT_BELOW = 14 // px: a box smaller than this on screen gets a dot as well, or it couldn't be seen or hit
+const WARNING_REACH = 14 // px: how near a dot or a box's edge a click counts
+const WARNINGS_RETRY = 15000 // ms: while the first ever look through the feeds is going on
+const WARNING_CATEGORIES = {
+  Military: [239, 68, 68],
+  'Search and rescue': [249, 115, 22],
+  Ice: [125, 211, 252],
+  Hazards: [250, 204, 21],
+  Operations: [192, 132, 252],
+  'Aids to navigation': [74, 222, 128],
+  Other: [148, 163, 184],
+}
+const WARNING_AGES = [
+  ['Any time', 0],
+  ['Last 7 days', 7],
+  ['Last 30 days', 30],
+  ['Last 90 days', 90],
+  ['Last year', 365],
+]
+const ROMAN = 'I II III IV V VI VII VIII IX X XI XII XIII XIV XV XVI XVII XVIII XIX XX'.split(' ')
+const allOf = (names) => Object.fromEntries(names.map((name) => [name, true]))
 
 // with hardware acceleration off in the browser, the CPU draws everything, and every point of every shape costs it
 function drawnInSoftware() {
@@ -48,11 +78,13 @@ const LAND_WALLS_ZOOM = SOFTWARE ? 11.5 : 10
 const HEAVY_BASEMAP = /^(tunnel|road|bridge|rail|aeroway|building|poi|housenumber|landuse|landcover|park|waterway|water$|water_shadow)/
 
 // from the basemap's own tiles, so they cost no waiting on anyone. In order, it goes charts, buildings, labels
+const BUILDING_RGB = SOFTWARE ? [75, 98, 122] : [127, 182, 230]
+const BUILDING_NIGHT = 0.4 // of their daytime colour
 const BUILDING_LOOK = {
   type: 'fill-extrusion',
   paint: {
     // see-through takes twice the drawing, so a CPU gets the colour that it comes to over the land
-    'fill-extrusion-color': SOFTWARE ? '#4b627a' : '#7fb6e6',
+    'fill-extrusion-color': `rgb(${BUILDING_RGB})`,
     'fill-extrusion-opacity': SOFTWARE ? 1 : 0.35,
     'fill-extrusion-base': ['+', LAND_TOP, ['coalesce', ['get', 'min_height'], 0]],
     'fill-extrusion-height': ['+', LAND_TOP, ['coalesce', ['get', 'height'], BUILDING_HEIGHT]],
@@ -102,6 +134,121 @@ function skylineTiles(m, detailed) {
   return tiles.sort((a, b) => a.away - b.away).slice(0, SKYLINE_TILES)
 }
 
+// where the sun is overhead at some moment: near enough to a tenth of a degree for centuries either side of 2000
+function sunAt(ms) {
+  const radians = Math.PI / 180
+  const days = ms / 86400000 - 10957.5
+  const anomaly = (357.529 + 0.98560028 * days) * radians
+  const mean = 280.459 + 0.98564736 * days
+  const longitude = (mean + 1.915 * Math.sin(anomaly) + 0.02 * Math.sin(2 * anomaly)) * radians
+  const tilt = (23.439 - 0.00000036 * days) * radians
+  const rightAscension = Math.atan2(Math.cos(tilt) * Math.sin(longitude), Math.cos(longitude)) / radians
+  const siderealDegrees = 280.46061837 + 360.98564736629 * days
+  const lon = ((((rightAscension - siderealDegrees) % 360) + 540) % 360) - 180
+  return { sunLat: Math.asin(Math.sin(tilt) * Math.sin(longitude)) / radians, sunLon: lon }
+}
+
+// 0 at night to 1 by day, through twilight: the same as the vertex shader's
+function daylightAt(lng, lat, { sunLat, sunLon }) {
+  const r = Math.PI / 180
+  const up = Math.sin(lat * r) * Math.sin(sunLat * r) + Math.cos(lat * r) * Math.cos(sunLat * r) * Math.cos((lng - sunLon) * r)
+  const t = Math.min(1, Math.max(0, (up + 0.21) / 0.26))
+  return t * t * (3 - 2 * t)
+}
+
+// the open sea wherever no chart is, far below everything, only so that night can fall on it too
+function worldSea() {
+  const lons = Array.from({ length: 109 }, (_, i) => -540 + i * 10)
+  const lats = Array.from({ length: 35 }, (_, i) => -85 + i * 5)
+  const positions = new Float32Array(lons.flatMap((lon) => lats.flatMap((lat) => [lon, lat, -11000])))
+  const colors = new Uint8Array(lons.length * lats.length * 4)
+  for (let i = 0; i < colors.length; i += 4) colors.set([8, 30, 66, 255], i)
+  const indices = []
+  for (let x = 0; x < lons.length - 1; x++) {
+    for (let y = 0; y < lats.length - 1; y++) {
+      const a = x * lats.length + y
+      const b = a + lats.length
+      indices.push(a, b, a + 1, a + 1, b, b + 1)
+    }
+  }
+  return {
+    id: 'sea',
+    origin: null,
+    meshes: {
+      waterSea: {
+        attributes: { positions: { value: positions, size: 3 }, colors: { value: colors, size: 4, normalized: true } },
+        indices: { value: new Uint32Array(indices), size: 1 },
+      },
+    },
+  }
+}
+const WORLD_SEA = worldSea()
+
+// warnings as what to draw: an area is a box its true size on the map, and anything with no size of its own is a dot
+function warningShapes(warnings, zoom) {
+  const metresPerPixel = (lat) => (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
+  const boxes = []
+  const dots = []
+  for (const warning of warnings) {
+    for (const { ring, point } of warning.shapes) {
+      if (point) {
+        dots.push({ warning, position: point })
+        continue
+      }
+      const lons = ring.map(([lon]) => lon)
+      const lats = ring.map(([, lat]) => lat)
+      const west = Math.min(...lons)
+      const east = Math.max(...lons)
+      const south = Math.min(...lats)
+      const north = Math.max(...lats)
+      const scale = metresPerPixel((south + north) / 2)
+      boxes.push({ warning, ring, height: Math.max(150, WARNING_HEIGHT * scale) })
+      const degreesPerPixel = (scale / 40075016) * 360
+      if ((north - south) / degreesPerPixel < WARNING_DOT_BELOW && (east - west) / degreesPerPixel < WARNING_DOT_BELOW) {
+        dots.push({ warning, position: [(west + east) / 2, (south + north) / 2] })
+      }
+    }
+  }
+  return { boxes, dots }
+}
+
+// the warnings under a point on the screen, the nearest and smallest first. Done here rather than by the graphics chip:
+// it asks nothing of it, it can be generous, and it counts a box's top as well as its foot
+function warningsAt(m, { boxes, dots }, x, y) {
+  const middle = m.getCenter().lng
+  const onScreen = ([lng, lat]) => {
+    const { x: px, y: py } = m.project([lng + 360 * Math.round((middle - lng) / 360), lat])
+    return [px, py]
+  }
+  const rise = WARNING_HEIGHT * Math.sin((m.getPitch() * Math.PI) / 180)
+  const hits = []
+  for (const { warning, position } of dots) {
+    const [px, py] = onScreen(position)
+    const away = Math.hypot(px - x, py - y)
+    if (away <= WARNING_REACH) hits.push({ warning, rank: away })
+  }
+  const nearby = [[0, 0], [WARNING_REACH / 2, 0], [-WARNING_REACH / 2, 0], [0, WARNING_REACH / 2], [0, -WARNING_REACH / 2]]
+  for (const { warning, ring } of boxes) {
+    const foot = ring.map(onScreen)
+    const top = foot.map(([px, py]) => [px, py - rise])
+    if (nearby.some(([dx, dy]) => inRing(x + dx, y + dy, foot) || inRing(x + dx, y + dy, top))) {
+      const xs = foot.map(([px]) => px)
+      hits.push({ warning, rank: WARNING_REACH + Math.max(...xs) - Math.min(...xs) })
+    }
+  }
+  return [...new Set(hits.sort((a, b) => a.rank - b.rank).map((hit) => hit.warning))]
+}
+
+function inRing(lng, lat, ring) {
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i]
+    const [xj, yj] = ring[j]
+    if (yi > lat !== yj > lat && lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside
+  }
+  return inside
+}
+
 const tierAt = (zoom) => (zoom < CHARTS_ZOOM ? 0 : 2 + TIER_ZOOMS.filter((z) => zoom >= z).length)
 
 // a compiled chart (backend/charts.py): the arrays go straight to the graphics chip as they are
@@ -132,12 +279,19 @@ const TIDE_UNIFORMS = `layout(std140) uniform tideUniforms {
   float shallow;
   float safety;
   float deep;
+  float originX;
+  float originY;
+  float sunLat;
+  float sunLon;
+  float lit;
 } tide;`
 const tideModule = {
   name: 'tide',
   vs: TIDE_UNIFORMS,
   fs: TIDE_UNIFORMS,
-  uniformTypes: { level: 'f32', seabed: 'f32', contours: 'f32', shallow: 'f32', safety: 'f32', deep: 'f32' },
+  uniformTypes: Object.fromEntries(
+    'level seabed contours shallow safety deep originX originY sunLat sunLon lit'.split(' ').map((name) => [name, 'f32']),
+  ),
 }
 
 // the least a mesh can cost to draw: colours are baked in, so there's no lighting to work out for each point and pixel
@@ -146,18 +300,28 @@ in vec3 positions;
 in vec4 colors;
 out vec3 color;
 out float height;
+out float sunUp;
+const float RADIANS = 0.01745329;
 void main() {
   color = colors.rgb;
   height = positions.z;
+  // worked out at each corner, as a CPU can't afford this per pixel. It runs true across even a huge triangle, unlike
+  // the twilight curve, which the pixels do for themselves
+  float lat = (tide.originY + positions.y) * RADIANS;
+  float lon = (tide.originX + positions.x - tide.sunLon) * RADIANS;
+  float sun = tide.sunLat * RADIANS;
+  sunUp = sin(lat) * sin(sun) + cos(lat) * cos(sun) * cos(lon);
   gl_Position = project_position_to_clipspace(positions, vec3(0.0), vec3(0.0));
 }`
 const FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 in vec3 color;
 in float height;
+in float sunUp;
 out vec4 fragColor;
 const vec3 DRY = vec3(0.52, 0.46, 0.33);
 const vec3 WET = vec3(0.12, 0.38, 0.50);
+const vec3 NIGHT = vec3(0.34, 0.40, 0.58);
 // an ECDIS's daytime depth colours, and its contour lines
 const vec3 DRYING = vec3(0.60, 0.68, 0.47);
 const vec3 VERY_SHALLOW = vec3(0.45, 0.71, 0.94);
@@ -193,6 +357,7 @@ void main() {
   } else if (height < tide.level) {
     c = mix(c, WET, 0.75);
   }
+  if (tide.lit > 0.5) c *= mix(NIGHT, vec3(1.0), smoothstep(-0.21, 0.05, sunUp));
   fragColor = vec4(c, 1.0);
 }`
 
@@ -213,8 +378,9 @@ class Mesh extends Layer {
 
   draw() {
     const { model } = this.state
-    const { level, seabed, contours } = this.props
-    model.shaderInputs.setProps({ tide: { level, seabed: seabed ? 1 : 0, ...contours } })
+    const { level, seabed, contours, sun, coordinateOrigin } = this.props
+    const [originX, originY] = coordinateOrigin
+    model.shaderInputs.setProps({ tide: { level, seabed: seabed ? 1 : 0, ...contours, ...sun, originX, originY } })
     model.draw(this.context.renderPass)
   }
 
@@ -230,7 +396,7 @@ const ONE = [{}]
 const TIDE_CARD =
   'absolute bottom-0 left-1/2 w-[min(38rem,calc(100%-2rem))] -translate-x-1/2 translate-y-[calc(100%-2.25rem)] rounded-t-xl border border-b-0 border-slate-700 bg-slate-900/90 px-4 pt-2.5 pb-4 text-slate-100 shadow-xl transition-transform duration-200 hover:translate-y-0 focus-within:translate-y-0'
 
-function chartLayers(chart, show, zoom, level, contours) {
+function chartLayers(chart, show, zoom, level, contours, sun) {
   const mesh = (key, visible, topology = 'triangle-list') =>
     chart.meshes[key] &&
     new Mesh({
@@ -241,7 +407,9 @@ function chartLayers(chart, show, zoom, level, contours) {
       topology,
       level,
       // walls take the depth colours but no lines: a chart's edge hangs through every depth, and would draw them all
-      contours: key === 'water' ? contours : { ...contours, contours: contours.contours === 2 ? 3 : 0 },
+      contours:
+        key === 'water' ? contours : { ...contours, contours: key === 'waterWalls' && contours.contours === 2 ? 3 : 0 },
+      sun,
       seabed: key.startsWith('water'),
       // (the world as a whole is too big to be offsets from anywhere)
       coordinateSystem: chart.origin ? COORDINATE_SYSTEM.LNGLAT_OFFSETS : COORDINATE_SYSTEM.LNGLAT,
@@ -250,6 +418,7 @@ function chartLayers(chart, show, zoom, level, contours) {
       getPolygonOffset: ({ layerIndex }) => [0, -layerIndex],
     })
   return [
+    mesh('waterSea', true),
     mesh('water', show.depare),
     mesh('waterWalls', show.depare),
     mesh('land', show.lndare),
@@ -262,8 +431,10 @@ function chartLayers(chart, show, zoom, level, contours) {
 // one layer to MapLibre, however many charts are showing
 class Charts extends CompositeLayer {
   renderLayers() {
-    const { data, show, zoom, level, contours } = this.props
-    return data.flatMap((chart) => chartLayers(chart, show, zoom, level, contours))
+    const { data, show, zoom, level, contours, sun } = this.props
+    // the sea last, as all but what no chart covers is hidden, and hidden costs a CPU nothing
+    const all = sun.lit ? [...data, WORLD_SEA] : data
+    return all.flatMap((chart) => chartLayers(chart, show, zoom, level, contours, sun))
   }
 }
 Charts.layerName = 'Charts'
@@ -451,6 +622,8 @@ export default function App() {
     tide: true,
     contours: false,
     ecdis: true,
+    daylight: true,
+    warnings: false,
   })
   const [contourDepths, setContourDepths] = useState({ shallow: '2', safety: '10', deep: '30' })
   const [menuOpen, setMenuOpen] = useState(true)
@@ -461,6 +634,40 @@ export default function App() {
   const [hour, setHour] = useState(0) // the tide being shown, from now
   const [compiling, setCompiling] = useState('')
   const [error, setError] = useState('')
+  const [clock, setClock] = useState(Date.now())
+  const [warnings, setWarnings] = useState(null)
+  const [warningCategories, setWarningCategories] = useState(allOf(Object.keys(WARNING_CATEGORIES)))
+  const [warningSource, setWarningSource] = useState('')
+  const [warningAge, setWarningAge] = useState(0)
+  const [pickedWarnings, setPickedWarnings] = useState([]) // what's under the last click
+  const [pickedTurn, setPickedTurn] = useState(0) // which of them is showing
+  const warningsOnMap = useRef({ boxes: [], dots: [] }) // for the map's own handlers
+  const overWarning = useRef(false)
+  const sunNow = useRef(null)
+  const lightBuildings = useRef(null)
+
+  useEffect(() => {
+    const timer = setInterval(() => setClock(Date.now()), CLOCK)
+    return () => clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!show.warnings) return
+    let timer
+    async function load() {
+      let wait = WARNINGS_REFRESH
+      try {
+        const answer = await (await fetch('/api/warnings')).json()
+        setWarnings(answer)
+        if (answer.loading) wait = WARNINGS_RETRY
+      } catch {
+        wait = WARNINGS_RETRY // the last ones stand until the next try
+      }
+      timer = setTimeout(load, wait)
+    }
+    load()
+    return () => clearTimeout(timer)
+  }, [show.warnings])
 
   useEffect(() => {
     async function poll() {
@@ -505,7 +712,10 @@ export default function App() {
     })
     m.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right')
     // interleaved: one canvas and one graphics context, so the map and charts can't drift apart as they move
-    overlay.current = new MapboxOverlay({ interleaved: true })
+    overlay.current = new MapboxOverlay({
+      interleaved: true,
+      getCursor: ({ isDragging }) => (isDragging ? 'grabbing' : overWarning.current ? 'pointer' : 'grab'),
+    })
     m.addControl(overlay.current)
     map.current = m
 
@@ -627,7 +837,36 @@ export default function App() {
       }
     }
 
-    m.on('moveend', () => refresh.current())
+    // buildings are the map's own, so they can't be lit per point: they take the light at the middle of the view
+    lightBuildings.current = () => {
+      const sun = sunNow.current
+      const { lng, lat } = m.getCenter()
+      const light = sun?.lit ? BUILDING_NIGHT + (1 - BUILDING_NIGHT) * daylightAt(lng, lat, sun) : 1
+      const colour = `rgb(${BUILDING_RGB.map((c) => Math.round(c * light))})`
+      for (const { id } of [SKYLINE, BUILDINGS]) {
+        if (m.getLayer(id)) m.setPaintProperty(id, 'fill-extrusion-color', colour)
+      }
+    }
+    m.once('load', () => lightBuildings.current())
+
+    m.on('click', ({ point: { x, y } }) => {
+      setPickedWarnings(warningsAt(m, warningsOnMap.current, x, y))
+      setPickedTurn(0)
+    })
+    let hovering = null
+    m.on('mousemove', ({ point }) => {
+      if (hovering) return
+      hovering = requestAnimationFrame(() => {
+        hovering = null
+        overWarning.current = warningsAt(m, warningsOnMap.current, point.x, point.y).length > 0
+        m.getCanvas().style.cursor = overWarning.current ? 'pointer' : 'grab'
+      })
+    })
+
+    m.on('moveend', () => {
+      lightBuildings.current()
+      refresh.current()
+    })
     refresh.current()
     return () => {
       clearInterval(tideTimer)
@@ -670,13 +909,77 @@ export default function App() {
     .sort((a, b) => a - b)
   const contourMode = show.contours ? (show.ecdis ? 2 : 1) : 0
 
+  // the sun goes with the tide bar's clock, so scrubbing through the hours brings day and night with them
+  const { sunLat, sunLon } = sunAt(clock + (show.tide ? hour : 0) * 3600000)
+  const lit = show.daylight ? 1 : 0
+
+  useEffect(() => {
+    sunNow.current = { sunLat, sunLon, lit }
+    lightBuildings.current?.()
+  }, [sunLat, sunLon, lit])
+
+  const oldestWarning = warningAge ? clock / 1000 - warningAge * 86400 : 0
+  const filteredWarnings = useMemo(
+    () =>
+      (warnings?.warnings ?? []).filter(
+        (w) =>
+          warningCategories[w.category] &&
+          (!warningSource || w.source === warningSource) &&
+          (w.issued ?? 0) >= oldestWarning,
+      ),
+    [warnings, warningCategories, warningSource, oldestWarning],
+  )
+  const warningsDrawn = show.warnings ? filteredWarnings : []
+  const picks = pickedWarnings.filter((w) => warningsDrawn.includes(w))
+  const picked = picks[Math.min(pickedTurn, picks.length - 1)] ?? null
+  const warningSources = useMemo(() => {
+    const names = [...new Set((warnings?.warnings ?? []).map((w) => w.source))]
+    return names.sort((a, b) => ROMAN.indexOf(a.split(' ')[1]) - ROMAN.indexOf(b.split(' ')[1]))
+  }, [warnings])
+
   useEffect(() => {
     const data = [...shown, ...charts]
     const contours = { contours: contourMode, shallow, safety, deep }
-    overlay.current?.setProps({
-      layers: [new Charts({ id: 'charts', beforeId: SKYLINE.id, data, show, zoom, level, contours })],
+    const sun = { sunLat, sunLon, lit }
+    const { boxes, dots } = warningShapes(warningsDrawn, zoom)
+    warningsOnMap.current = { boxes, dots }
+    const colourOf = ({ warning }) => WARNING_CATEGORIES[warning.category]
+    const boxLayer = new PolygonLayer({
+      id: 'warning-boxes',
+      beforeId: SKYLINE.id,
+      data: boxes,
+      visible: boxes.length > 0,
+      extruded: true,
+      wireframe: true,
+      material: false,
+      getPolygon: (box) => box.ring,
+      getElevation: (box) => box.height,
+      getFillColor: (box) => [...colourOf(box), box.warning === picked ? WARNING_FILL_PICKED : WARNING_FILL],
+      getLineColor: (box) => [...colourOf(box), WARNING_EDGE],
+      // see-through boxes mustn't hide what's behind them from each other
+      parameters: { depthWriteEnabled: false },
     })
-  }, [shown, charts, show, zoom, level, contourMode, shallow, safety, deep, ready])
+    const dotLayer = new ScatterplotLayer({
+      id: 'warning-dots',
+      beforeId: SKYLINE.id,
+      data: dots,
+      visible: dots.length > 0,
+      billboard: true,
+      stroked: true,
+      radiusUnits: 'pixels',
+      lineWidthUnits: 'pixels',
+      getPosition: (dot) => dot.position,
+      getRadius: (dot) => (dot.warning === picked ? WARNING_DOT_PICKED : WARNING_DOT),
+      getFillColor: colourOf,
+      getLineColor: [255, 255, 255, 220],
+      getLineWidth: 1,
+      // on a coast, or the land's height would cut them in half
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    overlay.current?.setProps({
+      layers: [new Charts({ id: 'charts', beforeId: SKYLINE.id, data, show, zoom, level, contours, sun }), boxLayer, dotLayer],
+    })
+  }, [shown, charts, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready])
 
   useEffect(() => {
     // they're only there to go with charts, and a coarse chart's coast would leave them standing in the water
@@ -729,7 +1032,7 @@ export default function App() {
         </button>
         <aside
           inert={!menuOpen}
-          className="flex max-h-[calc(100vh-2rem)] w-72 flex-col gap-4 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/90 p-4 text-sm text-slate-100 shadow-xl"
+          className="flex max-h-[calc(100vh-2rem)] w-72 flex-col gap-4 overflow-y-auto rounded-xl [scrollbar-color:#475569_transparent] [scrollbar-width:thin] border border-slate-700 bg-slate-900/90 p-4 text-sm text-slate-100 shadow-xl"
         >
           <h1 className="text-base font-semibold">ENC 3D</h1>
 
@@ -780,6 +1083,8 @@ export default function App() {
               ['lndare', 'Land'],
               ['buildings', 'Buildings'],
               ['tide', 'Tide bar'],
+              ['daylight', 'Day and night'],
+              ['warnings', 'Nav warnings'],
             ].map(([key, label]) => (
               <label key={key} className="flex items-center gap-2">
                 <input
@@ -792,6 +1097,68 @@ export default function App() {
               </label>
             ))}
           </fieldset>
+
+          {show.warnings && (
+            <fieldset className="flex flex-col gap-1">
+              <legend className="mb-1 font-medium text-slate-400">Nav warning filters</legend>
+              <p role="status" className="text-slate-300">
+                {!warnings || warnings.loading
+                  ? 'Collecting warnings: the first time takes a minute or two'
+                  : `${filteredWarnings.length} of ${warnings.warnings.length} showing`}
+              </p>
+              {Object.entries(WARNING_CATEGORIES).map(([name, rgb]) => (
+                <label key={name} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    className="accent-cyan-400"
+                    checked={warningCategories[name]}
+                    onChange={(e) => setWarningCategories({ ...warningCategories, [name]: e.target.checked })}
+                  />
+                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: `rgb(${rgb})` }} aria-hidden="true" />
+                  {name}
+                </label>
+              ))}
+              <label className="mt-2 flex flex-col gap-1 text-xs text-slate-400">
+                From
+                <select
+                  value={warningSource}
+                  onChange={(e) => setWarningSource(e.target.value)}
+                  className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
+                >
+                  <option value="">Everywhere</option>
+                  {warningSources.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="mt-2 flex flex-col gap-1 text-xs text-slate-400">
+                Issued
+                <select
+                  value={warningAge}
+                  onChange={(e) => setWarningAge(Number(e.target.value))}
+                  className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
+                >
+                  {WARNING_AGES.map(([label, days]) => (
+                    <option key={days} value={days}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {warnings?.unplaced > 0 && (
+                <p className="mt-2 text-xs text-slate-400">{warnings.unplaced} more give no position, so aren't on the map.</p>
+              )}
+              <p className="mt-1 text-xs text-slate-400">
+                From{' '}
+                <a href="https://www.sealagom.com/" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
+                  SeaLagom
+                </a>
+                ,{warnings?.checked ? ` checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}` : ' hourly'}
+              </p>
+            </fieldset>
+          )}
 
           <fieldset className="flex flex-col gap-2">
             <legend className="mb-1 font-medium text-slate-400">Depth contours</legend>
@@ -860,6 +1227,59 @@ export default function App() {
       >
         No ENCs Loaded
       </p>
+      {picked && (
+        <section
+          aria-label={`Nav warning ${picked.id}`}
+          className="absolute top-4 right-4 flex max-h-[60%] w-80 max-w-[calc(100%-2rem)] flex-col gap-2 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 [scrollbar-color:#475569_transparent] [scrollbar-width:thin] p-4 text-sm text-slate-100 shadow-xl"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <h2 className="font-semibold">{picked.id}</h2>
+            <button
+              type="button"
+              aria-label="Close this warning"
+              onClick={() => setPickedWarnings([])}
+              className="rounded px-1.5 text-slate-300 hover:text-cyan-300"
+            >
+              ×
+            </button>
+          </div>
+          <p className="flex items-center gap-2 text-slate-300">
+            <span
+              className="size-2.5 rounded-sm"
+              style={{ backgroundColor: `rgb(${WARNING_CATEGORIES[picked.category]})` }}
+              aria-hidden="true"
+            />
+            {picked.category}
+            {picked.issued && `, issued ${new Date(picked.issued * 1000).toLocaleDateString()}`}
+            {picked.ends && `, ends ${new Date(picked.ends * 1000).toLocaleDateString()}`}
+          </p>
+          {picks.length > 1 && (
+            <div className="flex items-center justify-between gap-2 text-slate-300">
+              <button
+                type="button"
+                aria-label="Previous warning here"
+                onClick={() => setPickedTurn((picks.indexOf(picked) + picks.length - 1) % picks.length)}
+                className="rounded border border-slate-600 px-2 hover:text-cyan-300"
+              >
+                ‹
+              </button>
+              {picks.indexOf(picked) + 1} of {picks.length} here
+              <button
+                type="button"
+                aria-label="Next warning here"
+                onClick={() => setPickedTurn((picks.indexOf(picked) + 1) % picks.length)}
+                className="rounded border border-slate-600 px-2 hover:text-cyan-300"
+              >
+                ›
+              </button>
+            </div>
+          )}
+          <p className="break-words whitespace-pre-wrap text-slate-200">{picked.text}</p>
+          <a href={picked.url} target="_blank" rel="noreferrer" className="text-cyan-300 underline">
+            See it on SeaLagom
+          </a>
+        </section>
+      )}
       {show.tide && <TidePanel tide={tide} hour={hour} setHour={setHour} />}
       <div className="absolute right-13 bottom-10 hidden origin-bottom-right scale-[0.45] items-end gap-5 transition-transform duration-200 hover:scale-100 focus-within:scale-100 md:flex">
         <div className="cube-scene">
