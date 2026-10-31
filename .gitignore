@@ -1,0 +1,9 @@
+# downloaded on first run
+enc/
+
+# made by the app and its build
+backend/cache/
+backend/.venv/
+__pycache__/
+frontend/node_modules/
+frontend/dist/

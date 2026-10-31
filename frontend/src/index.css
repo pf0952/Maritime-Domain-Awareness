@@ -1,0 +1,56 @@
+@import 'tailwindcss';
+
+/* the orientation cube: its size in rem is twice --half */
+.cube-scene {
+  --half: 1.75rem;
+  width: calc(var(--half) * 2);
+  height: calc(var(--half) * 2);
+  perspective: 18rem;
+}
+
+.cube {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+}
+
+.cube-face {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid #67e8f9;
+  background: rgb(15 23 42 / 0.92);
+  color: #e2e8f0;
+  font-size: 0.7rem;
+  font-weight: 600;
+  backface-visibility: hidden;
+  cursor: pointer;
+}
+
+.cube-face:hover,
+.cube-face:focus-visible {
+  background: #155e75;
+}
+
+.cube-face[data-face='top'] {
+  transform: translateZ(var(--half));
+}
+
+.cube-face[data-face='n'] {
+  color: #67e8f9;
+  transform: rotateX(90deg) translateZ(var(--half)) rotateZ(180deg);
+}
+
+.cube-face[data-face='s'] {
+  transform: rotateX(-90deg) translateZ(var(--half));
+}
+
+.cube-face[data-face='e'] {
+  transform: rotateY(90deg) translateZ(var(--half)) rotateZ(-90deg);
+}
+
+.cube-face[data-face='w'] {
+  transform: rotateY(-90deg) translateZ(var(--half)) rotateZ(90deg);
+}
