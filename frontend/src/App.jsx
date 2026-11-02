@@ -578,6 +578,12 @@ function SearchBar({ go }) {
   )
 }
 
+function cutFeeds(feeds) {
+  const areas = feeds.filter((f) => f.startsWith('navarea')).map((f) => `NAVAREA ${ROMAN[f.split('/')[1] - 1]}`)
+  const coastal = feeds.length - areas.length
+  return [...areas, ...(coastal ? [`${coastal} coastal ${coastal === 1 ? 'feed' : 'feeds'}`] : [])].join(' and ')
+}
+
 function LoadingScreen({ sync }) {
   const stage = useRef(null) // when this stage began to count, to tell how long it has left
   const { phase, done = 0, total = 0, problem } = sync ?? {}
@@ -1189,6 +1195,11 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              {warnings?.cut?.length > 0 && (
+                <p className="mt-2 text-xs text-amber-300">
+                  Some warnings are missing: {cutFeeds(warnings.cut)} reached SeaLagom's limit of 100, so their oldest are left out.
+                </p>
+              )}
               {warnings?.unplaced > 0 && (
                 <p className="mt-2 text-xs text-slate-400">{warnings.unplaced} more give no position, so aren't on the map.</p>
               )}
@@ -1196,8 +1207,8 @@ export default function App() {
                 From{' '}
                 <a href="https://www.sealagom.com/" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
                   SeaLagom
-                </a>
-                ,{warnings?.checked ? ` checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}` : ' hourly'}
+                </a>{' '}
+                and the UK Hydrographic Office,{warnings?.checked ? ` checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}` : ' hourly'}
               </p>
             </fieldset>
           )}
@@ -1326,7 +1337,7 @@ export default function App() {
           )}
           <p className="break-words whitespace-pre-wrap text-slate-200">{picked.text}</p>
           <a href={picked.url} target="_blank" rel="noreferrer" className="text-cyan-300 underline">
-            See it on SeaLagom
+            See it on {picked.url.includes('sealagom') ? 'SeaLagom' : 'the UKHO site'}
           </a>
         </section>
       )}

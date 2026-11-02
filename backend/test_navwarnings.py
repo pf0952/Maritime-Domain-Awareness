@@ -107,4 +107,28 @@ answer = nw.read([
     {**item, "url": "c", "feed": "coastal/14", "title": "Denmark NW-1"},
 ])
 assert answer["unplaced"] == 1 and [w["source"] for w in answer["warnings"]] == ["NAVAREA IV", "Coastal"]
+
+# the UKHO's page, as it writes a row and the row that opens from it
+page = """<td id="Reference_5" class="td-1">
+    WZ 683/26
+</td><td id="DateTimeGroupRnwFormat_5" class="td-2">
+    291325 UTC Oct 26
+</td><td id="Description_5">DOVER.</td>
+<tr id="collapse_5"><td><pre>DOVER. LIGHT UNLIT.&#xA;51-04.5N 001-11.8E.</pre></td></tr>"""
+item = nw.ukho_items(page)[0]
+assert item["title"] == "WZ 683/26" and item["url"].endswith("#WZ683/26") and "\n51-04.5N" in item["text"]
+assert item["issued"] == datetime.datetime(2026, 10, 29, 13, 25, tzinfo=datetime.UTC).timestamp()
+assert nw.source(item) == "UK coastal" and nw.source({**item, "title": "NAVAREA I 237/26"}) == "NAVAREA I"
+
+# its word goes over SeaLagom's copies, but those stay if it couldn't be read
+copy = {"feed": "navarea/1", "title": "NAVAREA I 61/26"}
+coastal_copy = {"feed": "coastal/40", "title": "WZ 683/26"}
+other = {"feed": "navarea/9", "title": "NAVAREA IX 5/26"}
+assert nw.official_first([item, copy, coastal_copy, other]) == [item, other]
+assert nw.official_first([copy, coastal_copy, other]) == [copy, coastal_copy, other]
+
+# a feed that's come up to the limit is reported, as it's probably lost some
+full = [{**now_item, "feed": "navarea/9", "url": str(n), "text": "NO POSITION"} for n in range(nw.FEED_LIMIT)]
+assert nw.read(full)["cut"] == ["navarea/9"] and nw.read(full[1:])["cut"] == []
+
 print("ok")

@@ -1,8 +1,10 @@
-"""Navigational warnings in force worldwide, from SeaLagom's free feeds: one for each NAVAREA and coastal authority.
+"""Navigational warnings in force worldwide, from SeaLagom's free feeds, one for each NAVAREA and coastal authority,
+and from the UK Hydrographic Office itself for its own waters.
 
 A warning is plain text, written for a radio operator: where it applies has to be read out of the words. So each one
 becomes a category, by what it talks about, and shapes: areas, as rings of [lon, lat], and points. The feeds take a
 minute or so to go through, so that happens in the background, and the last warnings stand meanwhile."""
+import collections
 import datetime
 import email.utils
 import html
@@ -18,6 +20,8 @@ from pathlib import Path
 import shapely
 
 SITE = "https://www.sealagom.com"
+UKHO = "https://msi.admiralty.co.uk/RadioNavigationalWarnings"  # all of NAVAREA I and its coastal WZ warnings in force
+FEED_LIMIT = 100  # SeaLagom's feeds stop here, newest first, so one this long has probably lost its oldest warnings
 SAVED = Path(__file__).parent.parent / "enc" / "nav_warnings.json"
 FRESH = 3600  # s: they come out through the day, but not by the minute
 TIMEOUT = 30  # s
@@ -81,6 +85,11 @@ WHEN = (
 DATE = re.compile(WHEN)
 CANCELLED = re.compile(rf"CANCEL\b[^.]{{0,70}}?THIS (?:MSG|MESSAGE|WARNING|PARAGRAPH|PARA)\b\D{{0,12}}{WHEN}")
 RUNS_TO = re.compile(rf"(?:\bTO|\bA|\bUNTILL?|\bTILL|\bTHRU|\bTHROUGH)\s+{WHEN}")
+
+WARNING_ROW = re.compile(
+    r'id="Reference_(\d+)"[^>]*>\s*(.*?)\s*</td>.*?id="DateTimeGroupRnwFormat_\1"[^>]*>\s*(.*?)\s*</td>.*?<pre[^>]*>(.*?)</pre>',
+    re.DOTALL,
+)
 
 refreshing = threading.Lock()
 found = {"items": None, "checked": 0.0}
@@ -225,20 +234,42 @@ def feed_items(name: str) -> list:
     return items
 
 
+def ukho_items(page: str) -> list:
+    """The warnings on the UKHO's page, shaped like a feed's."""
+    items = []
+    for _, reference, issued, text in WARNING_ROW.findall(page):
+        issued = datetime.datetime.strptime(issued, "%d%H%M UTC %b %y").replace(tzinfo=datetime.UTC)
+        items.append({
+            "feed": "ukho",
+            "title": reference,
+            "url": f"{UKHO}#{reference.replace(' ', '')}",  # (one page for all, and warnings are told apart by URL)
+            "text": html.unescape(text).strip(),
+            "issued": issued.timestamp(),
+        })
+    return items
+
+
+def official_first(items: list) -> list:
+    """The UKHO's word over SeaLagom's copies of its warnings, so that one it has cancelled goes at once."""
+    if not any(item["feed"] == "ukho" for item in items):
+        return items
+    return [item for item in items if item["feed"] == "ukho" or not (item["feed"] == "navarea/1" or item["title"].startswith("WZ "))]
+
+
 def refresh() -> None:
     """Goes through every feed. One that fails keeps the warnings it had."""
     try:
         listing = get(f"{SITE}/coastal/").decode("utf-8", "replace")
         coastal = sorted({int(n) for n in re.findall(r"/coastal/(\d+)/", listing)})
-        feeds = [f"navarea/{n}" for n in NAVAREAS] + [f"coastal/{n}" for n in coastal]
+        feeds = ["ukho"] + [f"navarea/{n}" for n in NAVAREAS] + [f"coastal/{n}" for n in coastal]
         items, failed = [], set()
         for feed in feeds:
             time.sleep(PAUSE)
             try:
-                items += feed_items(feed)
+                items += ukho_items(get(UKHO).decode("utf-8", "replace")) if feed == "ukho" else feed_items(feed)
             except (OSError, ET.ParseError, ValueError, TypeError):
                 failed.add(feed)
-        items += [item for item in found["items"] or [] if item["feed"] in failed]
+        items = official_first(items + [item for item in found["items"] or [] if item["feed"] in failed])
         if len(failed) < len(feeds) / 2:  # or the site's away: keep what we have
             SAVED.write_text(json.dumps(items), encoding="utf-8")
             found.update(items=items, checked=time.time())
@@ -246,6 +277,13 @@ def refresh() -> None:
         pass  # the next ask tries again
     finally:
         refreshing.release()
+
+
+def source(item: dict) -> str:
+    if item["feed"] == "ukho":
+        return "NAVAREA I" if item["title"].startswith("NAVAREA") else "UK coastal"
+    kind, number = item["feed"].split("/")
+    return f"NAVAREA {ROMAN[int(number) - 1]}" if kind == "navarea" else "Coastal"
 
 
 def read(items: list) -> dict:
@@ -266,18 +304,19 @@ def read(items: list) -> dict:
         if not where:
             unplaced += 1
             continue
-        number = int(item["feed"].split("/")[1])
         warnings[item["url"]] = {
             "id": item["title"],
             "url": item["url"],
-            "source": f"NAVAREA {ROMAN[number - 1]}" if item["feed"].startswith("navarea") else "Coastal",
+            "source": source(item),
             "category": kind,
             "issued": item["issued"],
             "ends": end,
             "text": item["text"],
             "shapes": where,
         }
-    return {"warnings": list(warnings.values()), "unplaced": unplaced}
+    counts = collections.Counter(item["feed"] for item in items)
+    full = [feed for feed, count in counts.items() if count >= FEED_LIMIT and feed != "ukho"]
+    return {"warnings": list(warnings.values()), "unplaced": unplaced, "cut": full}
 
 
 def current() -> dict:
@@ -287,5 +326,5 @@ def current() -> dict:
     if time.time() - found["checked"] > FRESH and refreshing.acquire(blocking=False):
         threading.Thread(target=refresh, daemon=True).start()
     if found["items"] is None:
-        return {"warnings": [], "unplaced": 0, "checked": None, "loading": True}
+        return {"warnings": [], "unplaced": 0, "cut": [], "checked": None, "loading": True}
     return {**read(found["items"]), "checked": found["checked"], "loading": False}
