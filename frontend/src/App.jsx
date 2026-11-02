@@ -1,5 +1,5 @@
 import { COORDINATE_SYSTEM, CompositeLayer, Layer, project32 } from '@deck.gl/core'
-import { PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
+import { PathLayer, PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
 import { MapboxOverlay } from '@deck.gl/mapbox'
 import { Geometry, Model } from '@luma.gl/engine'
 import { VectorTile } from '@mapbox/vector-tile'
@@ -34,8 +34,11 @@ const CUBE_FACES = [
 const OUTLINE_ZOOM = 8 // closer than this, the charts' coasts take over from the world's outline
 const NO_ENC_ZOOM = 5 // from here in, a view with no ENC at all says so
 const SEARCH_ZOOM = 14 // a place found is shown no closer than this
+const VESSEL_FOUND_ZOOM = 13 // and a vessel found, at this
+const VESSELS_FOUND = 8 // listed at most, of those a search finds
 const CLOCK = 60000 // ms: how often the sun moves
 const WARNINGS_REFRESH = 3600000 // ms
+const WARNINGS_LAG = 180000 // ms after the hour
 const WARNING_FILL = 28 // of 255: very see-through
 const WARNING_FILL_PICKED = 80
 const WARNING_EDGE = 170
@@ -65,6 +68,39 @@ const WARNING_AGES = [
 ]
 const ROMAN = 'I II III IV V VI VII VIII IX X XI XII XIII XIV XV XVI XVII XVIII XIX XX'.split(' ')
 const allOf = (names) => Object.fromEntries(names.map((name) => [name, true]))
+const AIS = 'https://ais.openwaters.io/v1/vessels' // free worldwide, no key: reads up to 120 a minute from one address
+const VESSEL_REFRESH = 60000 // ms: its tiles change every 10 s, but a whole world of them is 64 reads
+const VESSEL_TILES = 64 // at most at once, or it takes a coarser zoom
+const VESSEL_TILE_LOWEST = 3 // its tiles thin out ships at random below this, big ones too
+const VESSEL_ALL_ZOOM = 8 // further out, tiles of ship types that run big only, or they're thinned to mostly small craft
+const VESSEL_BIG_TYPES = '?type=60-89'
+const VESSEL_MIN_LENGTH = [[4, 200], [6, 100], [8, 50], [10, 20]] // below this zoom, only vessels this long, in m
+const VESSEL_LENGTH_PX = [7, 16] // true to scale, unless smaller on screen than this, from all the way out to the charts' zooms
+const VESSEL_BEAM = 0.5 // of the above: a ship true to scale would be nothing from far out
+const VESSEL_HEIGHT = 0.35 // of it again
+const VESSEL_SLIM = 6 // length to beam, for a vessel that doesn't report its beam
+const VESSEL_SHOULDER = 0.2 // of its length, ahead of the middle: where the hull starts to narrow to the bow
+const VESSEL_TALL = 0.12 // of its length: AIS gives no height
+const VESSEL_REACH = 12 // px: how near a click counts
+const VESSEL_DOT = 3 // px, for beacons, shore stations and gear: they have no heading or size to draw
+const AIDS = 'Aids and stations'
+const PLEASURE = 'Pleasure craft'
+const VESSEL_CATEGORIES = {
+  Cargo: [34, 197, 94],
+  Tanker: [239, 68, 68],
+  Passenger: [59, 130, 246],
+  Fishing: [249, 115, 22],
+  'Tugs and service': [20, 184, 166],
+  'High speed': [234, 179, 8],
+  [PLEASURE]: [217, 70, 239],
+  Other: [167, 139, 250],
+  Unknown: [148, 163, 184],
+  [AIDS]: [226, 232, 240],
+}
+const NAV_STATUS = [
+  'Under way using engine', 'At anchor', 'Not under command', 'Restricted manoeuvrability', 'Constrained by draught', 'Moored',
+  'Aground', 'Engaged in fishing', 'Under way sailing',
+]
 
 // with hardware acceleration off in the browser, the CPU draws everything, and every point of every shape costs it
 function drawnInSoftware() {
@@ -91,6 +127,17 @@ const BUILDING_LOOK = {
     'fill-extrusion-base': ['+', LAND_TOP, ['coalesce', ['get', 'min_height'], 0]],
     'fill-extrusion-height': ['+', LAND_TOP, ['coalesce', ['get', 'height'], BUILDING_HEIGHT]],
   },
+}
+// OpenStreetMap's coast stops at river mouths, so its land runs over harbours and rivers. Painted on top of it, beyond
+// the charts, as those have their own. It's flat, at a harbour's sort of depth by the charts' colours, as no depth comes with it
+const INLAND_WATER = {
+  id: 'inland-water',
+  type: 'fill',
+  source: 'protomaps',
+  'source-layer': 'water',
+  minzoom: 9,
+  filter: ['all', ['==', ['geometry-type'], 'Polygon'], ['!=', ['get', 'kind'], 'ocean']],
+  paint: { 'fill-color': 'rgb(78, 150, 176)' },
 }
 const SKYLINE = { ...BUILDING_LOOK, id: 'skyline', source: 'skyline', minzoom: SKYLINE_ZOOM, maxzoom: BUILDINGS_ZOOM }
 const BUILDINGS = {
@@ -187,6 +234,81 @@ function worldSea() {
 const WORLD_SEA = worldSea()
 
 // warnings as what to draw: an area is a box its true size on the map, and anything with no size of its own is a dot
+function vesselCategory({ kind, type }) {
+  if (kind && kind !== 'vessel') return AIDS
+  if (!type) return 'Unknown'
+  if (type === 30) return 'Fishing'
+  if (type === 36 || type === 37) return PLEASURE
+  if ((type >= 31 && type <= 33) || (type >= 50 && type <= 59)) return 'Tugs and service'
+  if (type >= 40 && type <= 49) return 'High speed'
+  if (type >= 60 && type <= 69) return 'Passenger'
+  if (type >= 70 && type <= 79) return 'Cargo'
+  if (type >= 80 && type <= 89) return 'Tanker'
+  return 'Other'
+}
+
+const vesselLengthAt = (zoom) => VESSEL_MIN_LENGTH.find(([below]) => zoom < below)?.[1] ?? 0
+
+// the tiles of the vessels in view, and the same filter as a query: the same answer means nothing to fetch
+function vesselTiles(m) {
+  const bounds = m.getBounds() // (past 180 on later copies of the world; tile numbers come back round)
+  for (let z = Math.max(Math.min(Math.floor(m.getZoom()), 14), VESSEL_TILE_LOWEST); ; z--) {
+    const from = tileAt(bounds.getWest(), bounds.getNorth(), z)
+    const to = tileAt(bounds.getEast(), bounds.getSouth(), z)
+    const tiles = new Set()
+    for (let across = Math.floor(from.x); across <= to.x && tiles.size <= VESSEL_TILES; across++) {
+      for (let y = Math.max(Math.floor(from.y), 0); y <= Math.min(to.y, 2 ** z - 1); y++) {
+        tiles.add(`${z}/${((across % 2 ** z) + 2 ** z) % 2 ** z}/${Math.floor(y)}`)
+      }
+    }
+    if (tiles.size <= VESSEL_TILES || z === VESSEL_TILE_LOWEST) {
+      return { tiles: [...tiles], query: m.getZoom() < VESSEL_ALL_ZOOM ? VESSEL_BIG_TYPES : '' }
+    }
+  }
+}
+
+// a rough hull, a pentagon with its point at the bow: true length and beam, unless they'd be too small on screen to see
+function vesselShape(vessel, zoom, level, middle) {
+  const { lat, hdg = 0 } = vessel
+  const lng = vessel.lng + 360 * Math.round((middle - vessel.lng) / 360)
+  const metresPerPixel = (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
+  const [smallest, largest] = VESSEL_LENGTH_PX
+  const least = (smallest + ((largest - smallest) * Math.min(zoom, VESSEL_ALL_ZOOM)) / VESSEL_ALL_ZOOM) * metresPerPixel
+  const length = Math.max(vessel.length || 0, least)
+  const beam = Math.max(vessel.beam || (vessel.length || 0) / VESSEL_SLIM, least * VESSEL_BEAM)
+  const east = Math.sin((hdg * Math.PI) / 180)
+  const north = Math.cos((hdg * Math.PI) / 180)
+  const across = 111320 * Math.cos((lat * Math.PI) / 180)
+  const point = (forward, side) => [lng + (forward * east + side * north) / across, lat + (forward * north - side * east) / 111320, level]
+  return {
+    vessel,
+    centre: [lng, lat],
+    reach: Math.max(VESSEL_REACH, length / 2 / metresPerPixel),
+    ring: [
+      point(length / 2, 0),
+      point(length * VESSEL_SHOULDER, beam / 2),
+      point(-length / 2, beam / 2),
+      point(-length / 2, -beam / 2),
+      point(length * VESSEL_SHOULDER, -beam / 2),
+    ],
+    height: Math.max(length * VESSEL_TALL, least * VESSEL_HEIGHT),
+  }
+}
+
+function vesselAt(m, shapes, x, y) {
+  let nearest = null
+  let best = Infinity
+  for (const shape of shapes) {
+    const { x: px, y: py } = m.project(shape.centre)
+    const away = Math.hypot(px - x, py - y)
+    if (away < shape.reach && away < best) {
+      nearest = shape.vessel
+      best = away
+    }
+  }
+  return nearest
+}
+
 function warningShapes(warnings, zoom) {
   const metresPerPixel = (lat) => (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
   const boxes = []
@@ -316,8 +438,10 @@ void main() {
   sunUp = sin(lat) * sin(sun) + cos(lat) * cos(sun) * cos(lon);
   gl_Position = project_position_to_clipspace(positions, vec3(0.0), vec3(0.0));
   // squeezed into the far end of the depth range, in order: anything a chart draws is in front of all of this, however
-  // deep, so a chart overwrites the world's seabed wherever it reaches, without either being cut to fit
-  if (tide.behind > 0.5) gl_Position.z = gl_Position.z * 0.01 + gl_Position.w * 0.99;
+  // deep, so a chart overwrites the world's seabed wherever it reaches, without either being cut to fit. Behind all of
+  // that goes the plain sea: from far out, a depth buffer can't tell it from the seabed by how far down it is
+  if (tide.behind > 1.5) gl_Position.z = gl_Position.w * 0.99999;
+  else if (tide.behind > 0.5) gl_Position.z = gl_Position.z * 0.0001 + gl_Position.w * 0.9998;
 }`
 const FRAGMENT_SHADER = `#version 300 es
 precision highp float;
@@ -355,8 +479,10 @@ void main() {
       }
       if (tide.contours < 2.5) {
         float pixel = max(fwidth(depth), 0.0001);
-        c = mix(c, LINE, max(line(depth, tide.shallow, pixel, 0.5), line(depth, tide.deep, pixel, 0.5)));
-        c = mix(c, SAFETY_LINE, line(depth, tide.safety, pixel, 1.0));
+        // where one pixel spans more depth than that, as rough seabed does from far out, a line would fill the pixel
+        float clear = 1.0 - smoothstep(20.0, 60.0, pixel);
+        c = mix(c, LINE, clear * max(line(depth, tide.shallow, pixel, 0.5), line(depth, tide.deep, pixel, 0.5)));
+        c = mix(c, SAFETY_LINE, clear * line(depth, tide.safety, pixel, 1.0));
       }
     }
     if (height > tide.level) c = mix(c, DRY, 0.85);
@@ -386,7 +512,7 @@ class Mesh extends Layer {
     const { model } = this.state
     const { level, seabed, behind, contours, sun, coordinateOrigin } = this.props
     const [originX, originY] = coordinateOrigin
-    const tide = { level, seabed: seabed ? 1 : 0, behind: behind ? 1 : 0, ...contours, ...sun, originX, originY }
+    const tide = { level, seabed: seabed ? 1 : 0, behind, ...contours, ...sun, originX, originY }
     model.shaderInputs.setProps({ tide })
     model.draw(this.context.renderPass)
   }
@@ -420,7 +546,7 @@ function chartLayers(chart, show, zoom, level, contours, sun) {
           : { ...contours, contours: key === 'waterWalls' && contours.contours === 2 ? 3 : 0 },
       sun,
       seabed: key.startsWith('water'),
-      behind: key === 'waterBase' || key === 'waterSea',
+      behind: { waterBase: 1, waterSea: 2 }[key] ?? 0,
       // (the world as a whole is too big to be offsets from anywhere)
       coordinateSystem: chart.origin ? COORDINATE_SYSTEM.LNGLAT_OFFSETS : COORDINATE_SYSTEM.LNGLAT,
       coordinateOrigin: chart.origin ? [...chart.origin, 0] : [0, 0, 0],
@@ -523,15 +649,25 @@ function SearchBar({ go }) {
     if (!query.trim()) return
     setNote('Searching')
     setPlaces([])
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`)
-      const found = res.ok ? await res.json() : null
-      setNote(found ? (found.length ? '' : 'Nothing found') : "Search isn't available just now")
-      setPlaces(found ?? [])
-      if (found?.length) go(found[0])
-    } catch {
-      setNote("Search isn't available just now")
-    }
+    const q = encodeURIComponent(query.trim())
+    const [towns, ships] = await Promise.all([
+      fetch(`/api/search?q=${q}`).then((res) => (res.ok ? res.json() : null), () => null),
+      // Open Waters looks up a ship by name or MMSI, wherever it is
+      fetch(`${AIS}?q=${q}`).then((res) => (res.ok ? res.json() : null), () => null),
+    ])
+    const vessels = (ships?.features ?? []).slice(0, VESSELS_FOUND).map(({ geometry: { coordinates: [lng, lat] }, properties }) => ({
+      name: `${properties.name || properties.mmsi} (vessel, ${vesselCategory(properties)})`,
+      vessel: { ...properties, hdg: properties.heading ?? properties.cog, lng, lat },
+    }))
+    // a ship named exactly so, or its MMSI, comes before places, unless a place is named so too: Rotterdam is a barge
+    const asked = query.trim().toUpperCase()
+    const exact =
+      vessels.some(({ vessel }) => [vessel.name, String(vessel.mmsi)].includes(asked)) &&
+      !(towns ?? []).some((town) => town.name.split(',')[0].trim().toUpperCase() === asked)
+    const found = exact ? [...vessels, ...(towns ?? [])] : [...(towns ?? []), ...vessels]
+    setNote(towns || ships ? (found.length ? '' : 'Nothing found') : "Search isn't available just now")
+    setPlaces(found)
+    if (found.length) go(found[0])
   }
 
   return (
@@ -542,8 +678,8 @@ function SearchBar({ go }) {
     >
       <input
         type="search"
-        aria-label="Search for a place"
-        placeholder="Search for a place, then press Enter"
+        aria-label="Search for a place or vessel"
+        placeholder="Search for a place or vessel, then press Enter"
         value={query}
         onChange={(e) => {
           setQuery(e.target.value)
@@ -558,8 +694,8 @@ function SearchBar({ go }) {
       {note && <p className="mt-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">{note}</p>}
       {places.length > 1 && (
         <ul className="mt-1 overflow-hidden rounded-lg border border-slate-700 bg-slate-900 shadow-xl">
-          {places.map((place) => (
-            <li key={place.name}>
+          {places.map((place, i) => (
+            <li key={`${i} ${place.name}`}>
               <button
                 type="button"
                 onClick={() => {
@@ -584,6 +720,47 @@ function cutFeeds(feeds) {
   return [...areas, ...(coastal ? [`${coastal} coastal ${coastal === 1 ? 'feed' : 'feeds'}`] : [])].join(' and ')
 }
 
+function aisValue(key, value) {
+  if (key === 'nav_status') return NAV_STATUS[value] ?? `Status ${value}`
+  if (key === 'sog') return `${value} kn`
+  if (key === 'cog' || key === 'heading' || key === 'hdg') return `${value}°`
+  if (['length', 'beam', 'draught', 'to_bow', 'to_stern', 'to_port', 'to_starboard'].includes(key)) return `${value} m`
+  return String(value)
+}
+
+// every field it has sent: the map's tiles carry a few, and the rest comes from the vessel's own record
+function VesselCard({ vessel, detail, close }) {
+  const { particulars = {}, ...fields } = detail?.properties ?? vessel
+  const shown = ([key, value]) => value !== null && value !== '' && typeof value !== 'object' && !['lng', 'lat', 'mmsi', 'name'].includes(key)
+  const row = ([key, value]) => (
+    <div key={key} className="flex justify-between gap-3">
+      <dt className="text-slate-400">{key.replaceAll('_', ' ')}</dt>
+      <dd className="text-right break-words">{aisValue(key, value)}</dd>
+    </div>
+  )
+  return (
+    <section
+      aria-label={`Vessel ${vessel.name ?? vessel.mmsi}`}
+      className="absolute top-4 right-4 flex max-h-[60%] w-80 max-w-[calc(100%-2rem)] flex-col gap-2 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 [scrollbar-color:#475569_transparent] [scrollbar-width:thin] p-4 text-sm text-slate-100 shadow-xl"
+    >
+      <header className="flex items-start justify-between gap-2">
+        <div>
+          <h2 className="font-semibold">{fields.name ?? 'Unnamed vessel'}</h2>
+          <p className="text-xs text-slate-400">{vesselCategory(fields)}, MMSI {vessel.mmsi}</p>
+        </div>
+        <button type="button" aria-label="Close" onClick={close} className="rounded px-1 text-slate-300 hover:text-cyan-300">
+          ×
+        </button>
+      </header>
+      <dl className="flex flex-col gap-0.5 text-xs">{Object.entries(fields).filter(shown).map(row)}</dl>
+      {Object.keys(particulars).length > 0 && (
+        <dl className="flex flex-col gap-0.5 border-t border-slate-700 pt-2 text-xs">{Object.entries(particulars).filter(shown).map(row)}</dl>
+      )}
+      <p className="text-xs text-slate-400">{Object.values(detail?.attribution ?? {}).join(' ') || 'Open Waters AIS'}</p>
+    </section>
+  )
+}
+
 function LoadingScreen({ sync }) {
   const stage = useRef(null) // when this stage began to count, to tell how long it has left
   const { phase, done = 0, total = 0, problem } = sync ?? {}
@@ -592,7 +769,9 @@ function LoadingScreen({ sync }) {
   }
   const rate = (done - stage.current.done) / (Date.now() - stage.current.at)
   const minutes = rate > 0 ? Math.ceil((total - done) / rate / 60000) : null
-  const heading = { downloading: 'Downloading charts from NOAA', compiling: 'Preparing charts' }[phase] ?? 'Checking charts'
+  const heading =
+    { downloading: 'Downloading charts from NOAA', compiling: 'Preparing charts', warnings: 'Placing nav warnings' }[phase] ??
+    'Checking charts'
   const counting = (phase === 'downloading' || phase === 'compiling') && total > 0
   const percent = counting ? Math.floor((100 * done) / total) : 0
   return (
@@ -645,6 +824,7 @@ export default function App() {
     ecdis: true,
     daylight: true,
     warnings: false,
+    vessels: true,
   })
   const [contourDepths, setContourDepths] = useState({ shallow: '2', safety: '10', deep: '30' })
   const [menuOpen, setMenuOpen] = useState(true)
@@ -658,11 +838,21 @@ export default function App() {
   const [clock, setClock] = useState(Date.now())
   const [warnings, setWarnings] = useState(null)
   const [warningCategories, setWarningCategories] = useState(allOf(Object.keys(WARNING_CATEGORIES)))
+  const [vessels, setVessels] = useState([])
+  const [vesselsAsked, setVesselsAsked] = useState(false)
+  const [vesselsFailed, setVesselsFailed] = useState(false)
+  const [vesselCategories, setVesselCategories] = useState({ ...allOf(Object.keys(VESSEL_CATEGORIES)), [PLEASURE]: false })
+  const [pickedVessel, setPickedVessel] = useState(null)
+  const [vesselDetail, setVesselDetail] = useState(null)
+  const [vesselTrack, setVesselTrack] = useState(null)
   const [warningSource, setWarningSource] = useState('')
   const [warningAge, setWarningAge] = useState(0)
   const [pickedWarnings, setPickedWarnings] = useState([]) // what's under the last click
   const [pickedTurn, setPickedTurn] = useState(0) // which of them is showing
   const warningsOnMap = useRef({ boxes: [], dots: [] }) // for the map's own handlers
+  const vesselsOnMap = useRef([])
+  const loadVessels = useRef(null)
+  const vesselsOn = useRef(true)
   const overWarning = useRef(false)
   const sunNow = useRef(null)
   const lightBuildings = useRef(null)
@@ -676,7 +866,8 @@ export default function App() {
     if (!show.warnings) return
     let timer
     async function load() {
-      let wait = WARNINGS_REFRESH
+      // the backend reads the feeds on the hour, and takes a minute or two
+      let wait = WARNINGS_REFRESH - (Date.now() % WARNINGS_REFRESH) + WARNINGS_LAG
       try {
         const answer = await (await fetch('/api/warnings')).json()
         setWarnings(answer)
@@ -721,7 +912,7 @@ export default function App() {
       const kept = style.layers
         .filter((l) => !HEAVY_BASEMAP.test(l.id))
         .map((l) => (l.type === 'background' ? { ...l, paint: { 'background-color': OCEAN } } : l))
-      kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, SKYLINE, BUILDINGS)
+      kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, INLAND_WATER, SKYLINE, BUILDINGS)
       return kept
     }
     m.setStyle(BASEMAP, {
@@ -828,6 +1019,43 @@ export default function App() {
     m.on('move', followCamera)
     followCamera()
 
+    let vesselRequest = null
+    let vesselsShowing = ''
+
+    // what's showing stays until all of this view has arrived, so nothing blinks out in between
+    loadVessels.current = async (again = false) => {
+      if (!vesselsOn.current) return
+      const { tiles, query } = vesselTiles(m)
+      const wanted = tiles.join() + query
+      if (wanted === vesselsShowing && !again) return
+      vesselRequest?.abort()
+      vesselRequest = new AbortController()
+      const { signal } = vesselRequest
+      const found = new Map()
+      const answers = await Promise.allSettled(
+        tiles.map(async (tile) => {
+          const res = await fetch(`${AIS}/tiles/${tile}${query}`, { signal })
+          if (!res.ok) throw new Error(res.status)
+          const data = await res.arrayBuffer()
+          const layer = data.byteLength ? new VectorTile(new PbfReader(data)).layers.vessels : null
+          const [z, x, y] = tile.split('/').map(Number)
+          for (let i = 0; i < (layer?.length ?? 0); i++) {
+            const feature = layer.feature(i)
+            const [lng, lat] = feature.toGeoJSON(x, y, z).geometry.coordinates
+            found.set(feature.properties.mmsi, { ...feature.properties, lng, lat })
+          }
+        }),
+      )
+      if (signal.aborted) return // a newer view took over
+      const failed = answers.every(({ status }) => status === 'rejected')
+      setVesselsFailed(failed)
+      setVesselsAsked(true)
+      if (failed) return // the last ones stand until the next try
+      vesselsShowing = wanted
+      setVessels([...found.values()])
+    }
+    const vesselTimer = setInterval(() => loadVessels.current(true), VESSEL_REFRESH)
+
     refresh.current = async () => {
       request?.abort()
       request = new AbortController()
@@ -877,7 +1105,9 @@ export default function App() {
     m.once('load', () => lightBuildings.current())
 
     m.on('click', ({ point: { x, y } }) => {
-      setPickedWarnings(warningsAt(m, warningsOnMap.current, x, y))
+      const vessel = vesselAt(m, vesselsOnMap.current, x, y)
+      setPickedVessel(vessel)
+      setPickedWarnings(vessel ? [] : warningsAt(m, warningsOnMap.current, x, y))
       setPickedTurn(0)
     })
     let hovering = null
@@ -885,7 +1115,8 @@ export default function App() {
       if (hovering) return
       hovering = requestAnimationFrame(() => {
         hovering = null
-        overWarning.current = warningsAt(m, warningsOnMap.current, point.x, point.y).length > 0
+        const { x, y } = point
+        overWarning.current = !!vesselAt(m, vesselsOnMap.current, x, y) || warningsAt(m, warningsOnMap.current, x, y).length > 0
         m.getCanvas().style.cursor = overWarning.current ? 'pointer' : 'grab'
       })
     })
@@ -893,10 +1124,13 @@ export default function App() {
     m.on('moveend', () => {
       lightBuildings.current()
       refresh.current()
+      loadVessels.current()
     })
     refresh.current()
     return () => {
       clearInterval(tideTimer)
+      clearInterval(vesselTimer)
+      vesselRequest?.abort()
       request?.abort()
       skylineRequest?.abort()
       m.remove()
@@ -911,8 +1145,14 @@ export default function App() {
       .catch(() => {})
   }, [ready])
 
-  function goTo({ bounds: [w, s, e, n] }) {
+  function goTo({ bounds, vessel }) {
     const camera = { pitch: map.current.getPitch(), bearing: map.current.getBearing() }
+    if (vessel) {
+      map.current.jumpTo({ ...camera, center: [vessel.lng, vessel.lat], zoom: VESSEL_FOUND_ZOOM })
+      setPickedVessel(vessel)
+      return
+    }
+    const [w, s, e, n] = bounds
     map.current.fitBounds([[w, s], [e, n]], { ...camera, maxZoom: SEARCH_ZOOM, padding: 60, animate: false })
   }
 
@@ -927,8 +1167,14 @@ export default function App() {
     refresh.current?.()
   }, [sync?.revision])
 
+  useEffect(() => {
+    vesselsOn.current = show.vessels
+    loadVessels.current?.()
+  }, [show.vessels, ready])
+
   const warningsLoading = show.warnings && (!warnings || warnings.loading)
-  const busy = loading || skylineLoading || warningsLoading || (show.tide && !tideAsked) || !!compiling
+  const firstLoads = (show.tide && !tideAsked) || (show.vessels && !vesselsAsked)
+  const busy = loading || skylineLoading || warningsLoading || firstLoads || !!compiling
   useEffect(() => {
     const timer = setTimeout(() => setGrey(busy), busy ? GREY_AFTER : UNGREY_AFTER)
     return () => clearTimeout(timer)
@@ -971,6 +1217,41 @@ export default function App() {
     return names.sort((a, b) => ROMAN.indexOf(a.split(' ')[1]) - ROMAN.indexOf(b.split(' ')[1]))
   }, [warnings])
 
+  const smallestVessel = vesselLengthAt(zoom)
+  const filteredVessels = useMemo(
+    () => vessels.filter((v) => vesselCategories[vesselCategory(v)] && (v.length || 0) >= smallestVessel),
+    [vessels, vesselCategories, smallestVessel],
+  )
+  // one picked from a search shows even if the live tiles don't have it (heard too long ago, say) or it's filtered out
+  const searched = pickedVessel && !filteredVessels.some((v) => v.mmsi === pickedVessel.mmsi) ? [pickedVessel] : []
+  const vesselsDrawn = show.vessels ? [...filteredVessels, ...searched] : []
+  const vesselShapes = useMemo(() => {
+    const middle = map.current?.getCenter().lng ?? 0
+    // beyond the charts, harbours are painted on the land's top, not cut from it
+    const base = charted ? level : LAND_TOP
+    return vesselsDrawn.filter((v) => v.kind === 'vessel').map((v) => vesselShape(v, zoom, base, middle))
+  }, [filteredVessels, show.vessels, zoom, level, charted, searched[0]])
+  const vesselDots = vesselsDrawn.filter((v) => v.kind !== 'vessel')
+
+  useEffect(() => {
+    setVesselDetail(null)
+    setVesselTrack(null)
+    if (!pickedVessel) return
+    const request = new AbortController()
+    const { signal } = request
+    const read = async (path, use) => {
+      try {
+        const res = await fetch(`${AIS}/${pickedVessel.mmsi}${path}`, { signal })
+        if (res.ok) use(await res.json())
+      } catch {
+        // what the map knows of it stands
+      }
+    }
+    read('', setVesselDetail)
+    read('/track?interval=5m', (track) => setVesselTrack(track.geometry?.type === 'LineString' ? track.geometry.coordinates : null))
+    return () => request.abort()
+  }, [pickedVessel])
+
   useEffect(() => {
     const data = shown
     const contours = { contours: contourMode, shallow, safety, deep }
@@ -1010,10 +1291,60 @@ export default function App() {
       // on a coast, or the land's height would cut them in half
       parameters: { depthCompare: 'always', depthWriteEnabled: false },
     })
-    overlay.current?.setProps({
-      layers: [new Charts({ id: 'charts', beforeId: SKYLINE.id, data, show, zoom, level, contours, sun }), boxLayer, dotLayer],
+    vesselsOnMap.current = vesselShapes
+    const vesselColour = ({ vessel }) =>
+      vessel.mmsi === pickedVessel?.mmsi ? [255, 255, 255] : VESSEL_CATEGORIES[vesselCategory(vessel)]
+    const vesselLayer = new PolygonLayer({
+      id: 'vessels',
+      beforeId: SKYLINE.id,
+      data: vesselShapes,
+      visible: vesselShapes.length > 0,
+      extruded: true,
+      material: false,
+      getPolygon: (shape) => shape.ring,
+      getElevation: (shape) => shape.height,
+      getFillColor: vesselColour,
+      updateTriggers: { getFillColor: pickedVessel?.mmsi },
     })
-  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready])
+    const vesselDotLayer = new ScatterplotLayer({
+      id: 'vessel-dots',
+      beforeId: SKYLINE.id,
+      data: vesselDots,
+      visible: vesselDots.length > 0,
+      radiusUnits: 'pixels',
+      getPosition: (dot) => [dot.lng, dot.lat],
+      getRadius: VESSEL_DOT,
+      getFillColor: VESSEL_CATEGORIES[AIDS],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    const trackLayer = new PathLayer({
+      id: 'vessel-track',
+      beforeId: SKYLINE.id,
+      data: vesselTrack ? [vesselTrack] : [],
+      visible: !!vesselTrack,
+      widthUnits: 'pixels',
+      getPath: (path) => path,
+      getWidth: 2,
+      getColor: [255, 255, 255, 170],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    overlay.current?.setProps({
+      layers: [
+        new Charts({ id: 'charts', beforeId: INLAND_WATER.id, data, show, zoom, level, contours, sun }),
+        boxLayer,
+        dotLayer,
+        trackLayer,
+        vesselLayer,
+        vesselDotLayer,
+      ],
+    })
+  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, pickedVessel, vesselTrack])
+
+  useEffect(() => {
+    if (map.current?.getLayer(INLAND_WATER.id)) {
+      map.current.setLayoutProperty(INLAND_WATER.id, 'visibility', show.lndare && !charted ? 'visible' : 'none')
+    }
+  }, [show.lndare, charted])
 
   useEffect(() => {
     // they're only there to go with charts, and a coarse chart's coast would leave them standing in the water
@@ -1061,6 +1392,8 @@ export default function App() {
 
   if (!ready) return <LoadingScreen sync={sync} />
 
+  const enc = shown.filter((piece) => !/^(WORLD|COAST_|SEA_)/.test(piece.id))
+
   return (
     <div className="fixed inset-0 bg-slate-950">
       <div ref={mapBox} className="h-full" />
@@ -1091,7 +1424,7 @@ export default function App() {
               {loading && (
                 <span className="size-3 shrink-0 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
               )}
-              {loading ? 'Loading charts in view' : `${shown.length} in view`}
+              {loading ? 'Loading charts in view' : `${enc.length} ${enc.length === 1 ? 'ENC' : 'ENCs'} in view`}
             </p>
           </div>
 
@@ -1133,6 +1466,7 @@ export default function App() {
               ['tide', 'Tide bar'],
               ['daylight', 'Day and night'],
               ['warnings', 'Nav warnings'],
+              ['vessels', 'Vessels (AIS)'],
             ].map(([key, label]) => (
               <label key={key} className="flex items-center gap-2">
                 <input
@@ -1145,6 +1479,39 @@ export default function App() {
               </label>
             ))}
           </fieldset>
+
+          {show.vessels && (
+            <fieldset className="flex flex-col gap-1">
+              <legend className="mb-1 font-medium text-slate-400">Vessel filters</legend>
+              <p role="status" className="text-slate-300">
+                {vesselsFailed ? 'No AIS data just now' : `${filteredVessels.length} of ${vessels.length} in view`}
+              </p>
+              {Object.entries(VESSEL_CATEGORIES).map(([name, rgb]) => (
+                <label key={name} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    className="accent-cyan-400"
+                    checked={vesselCategories[name]}
+                    onChange={(e) => setVesselCategories({ ...vesselCategories, [name]: e.target.checked })}
+                  />
+                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: `rgb(${rgb})` }} aria-hidden="true" />
+                  {name}
+                </label>
+              ))}
+              {smallestVessel > 0 && <p className="mt-2 text-xs text-slate-400">{smallestVessel} m and longer at this zoom: closer in, smaller ones show.</p>}
+              <p className="mt-1 text-xs text-slate-400">
+                From{' '}
+                <a href="https://openwaters.io/ais/" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
+                  Open Waters AIS
+                </a>{' '}
+                and its sources, among them{' '}
+                <a href="https://www.aishub.net" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
+                  AISHub
+                </a>
+                . It doesn't reach every vessel, and little of the open ocean.
+              </p>
+            </fieldset>
+          )}
 
           {show.warnings && (
             <fieldset className="flex flex-col gap-1">
@@ -1314,6 +1681,9 @@ export default function App() {
             {picked.issued && `, issued ${new Date(picked.issued * 1000).toLocaleDateString()}`}
             {picked.ends && `, ends ${new Date(picked.ends * 1000).toLocaleDateString()}`}
           </p>
+          {picked.placedBy && (
+            <p className="text-xs text-amber-300">It gives no position: shown roughly, at {picked.placedBy}, a place it names.</p>
+          )}
           {picks.length > 1 && (
             <div className="flex items-center justify-between gap-2 text-slate-300">
               <button
@@ -1341,6 +1711,7 @@ export default function App() {
           </a>
         </section>
       )}
+      {pickedVessel && <VesselCard vessel={pickedVessel} detail={vesselDetail} close={() => setPickedVessel(null)} />}
       {show.tide && <TidePanel tide={tide} hour={hour} setHour={setHour} />}
       <div className="absolute right-13 bottom-10 hidden origin-bottom-right scale-[0.45] items-end gap-5 transition-transform duration-200 hover:scale-100 focus-within:scale-100 md:flex">
         <div className="cube-scene">

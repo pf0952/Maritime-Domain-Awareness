@@ -52,7 +52,7 @@ assert len(catalog.charts) < len(files) < 2 * len(catalog.charts)
 
 def view(west: float, south: float, east: float, north: float, corners: str | None = None) -> dict:
     corners = corners or f"{west},{north},{east},{north},{east},{south},{west},{south}"
-    params = {"west": west, "south": south, "east": east, "north": north, "tier": 5, "corners": corners, "zoom": 9}
+    params = {"west": west, "south": south, "east": east, "north": north, "tier": 5, "corners": corners, "zoom": 10}
     return TestClient(main.app).get("/api/view", params=params).json()
 
 
@@ -104,6 +104,7 @@ assert 2000 < len(numbers) and 0 <= min(numbers) and max(numbers) <= 360 and len
 assert sync.land_view(shapely.box(-120, 20, -60, 50), 3, catalog) == ["WORLD"]
 assert all(name.startswith("COAST_1_") for name in sync.land_view(harbour, 9, catalog))
 assert sync.land_bounds("COAST_0_10_13") == (-80, 40, -70, 50)
+assert not sync.wanted_tile(Path("COAST_0_-1_-1-abc.gz")) and not sync.wanted_tile(Path("SEA_0_99_99-4.gz"))
 
 
 class DeadPool:
@@ -228,7 +229,7 @@ with tempfile.TemporaryDirectory() as tmp:
 if sync.have_sea():
     with tempfile.TemporaryDirectory() as tmp:
         tiles = {}
-        for name in ("SEA_2_1_60", "SEA_2_2_60", "SEA_2_143_60", "SEA_2_0_60", "SEA_2_35_60", "SEA_2_36_60"):  # (Pacific,
+        for name in ("SEA_3_1_60", "SEA_3_2_60", "SEA_3_143_60", "SEA_3_0_60", "SEA_3_35_60", "SEA_3_36_60"):  # (Pacific,
             out = Path(tmp) / f"{name}.gz"  # the date line, and where two of GEBCO's files meet)
             charts.compile_sea(sync.SEA, sync.sea_bounds(name), out)
             size = struct.unpack("<I", gzip.decompress(out.read_bytes())[:4])[0]
@@ -243,11 +244,17 @@ if sync.have_sea():
             line = xyz[np.abs(xyz[:, 0] - lon) < 1e-3]
             return line[np.argsort(line[:, 1]), 2]
 
-        for left, right, lon in (("SEA_2_1_60", "SEA_2_2_60", -175), ("SEA_2_35_60", "SEA_2_36_60", -90)):
+        for left, right, lon in (("SEA_3_1_60", "SEA_3_2_60", -175), ("SEA_3_35_60", "SEA_3_36_60", -90)):
             assert len(edge(tiles[left], lon)) and (edge(tiles[left], lon) == edge(tiles[right], lon)).all(), lon
-        assert (edge(tiles["SEA_2_143_60"], 180) == edge(tiles["SEA_2_0_60"], -180)).all(), "date line"
+        assert (edge(tiles["SEA_3_143_60"], 180) == edge(tiles["SEA_3_0_60"], -180)).all(), "date line"
     assert len(sync.sea_view(shapely.box(-180, -85, 180, 85), 12)) <= 144
     assert all(name.startswith("SEA_0") for name in sync.sea_view(shapely.box(-180, -85, 180, 85), 12))
-    assert all(name.startswith("SEA_3") for name in sync.sea_view(shapely.box(-70.1, 42, -70, 42.1), 12))
-    assert all(name.startswith("SEA_1") for name in sync.sea_view(shapely.box(-70.1, 42, -70, 42.1), 6))
+    assert all(name.startswith("SEA_4") for name in sync.sea_view(shapely.box(-70.1, 42, -70, 42.1), 12))
+    assert all(name.startswith("SEA_2") for name in sync.sea_view(shapely.box(-70.1, 42, -70, 42.1), 6))
+    for bad in ("SEA_0_6_0", "SEA_0_0_3", "SEA_0_-1_0", "SEA_9_0_0"):
+        try:
+            sync.sea_bounds(bad)
+            assert False, bad
+        except (ValueError, IndexError):
+            pass
 print("ok")

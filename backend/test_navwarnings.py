@@ -131,4 +131,29 @@ assert nw.official_first([copy, coastal_copy, other]) == [copy, coastal_copy, ot
 full = [{**now_item, "feed": "navarea/9", "url": str(n), "text": "NO POSITION"} for n in range(nw.FEED_LIMIT)]
 assert nw.read(full)["cut"] == ["navarea/9"] and nw.read(full[1:])["cut"] == []
 
+# positions written other ways: Turkish letters, Chinese running on, a label before the longitude, after a dash
+assert nw.positions("EGE DENİZİ 36 38.88 K - 028 03.69 D MEVKİNDEKİ") == [[28.0615, 36.648]]
+assert nw.positions("以21-22.96N 115-22.82E为圆心") == [[115.38033333333334, 21.382666666666665]]
+assert nw.positions("LAT. 52-20.10S. LONG. 069-04.60W.") == [[-69.07666666666667, -52.335]]
+assert nw.positions("BUOY 34 40.722N-033 15.478E MISSING") == [[33.25796666666667, 34.6787]]
+
+# with none, the smallest place it names, the last of the same size, and only near the rest of its feed
+nw.places.update(
+    names={
+        "BLACK SEA": (nw.shapely.box(27, 41, 41, 47), 84),
+        "BURGAS": (nw.shapely.Point(27.47, 42.5), 0),
+        "VARNA": (nw.shapely.Point(27.9, 43.2), 0),
+        "PORTLAND": (nw.shapely.Point(-70.25, 43.66), 0),
+    },
+    longest=2,
+    joined=[],
+)
+assert nw.named_place("BLACK SEA. BULGARIA. BURGAS BAY. SURVEY", None)[0] == "BURGAS"
+assert nw.named_place("FROM VARNA TO BURGAS", None)[0] == "BURGAS"
+assert nw.named_place("PORTLAND HARBOUR", (20, 35, 45, 50)) is None
+assert nw.place_shape(nw.shapely.Point(27.47, 42.5)) == {"point": [27.47, 42.5]}
+named = {**now_item, "feed": "coastal/127", "url": "named", "text": "BULGARIA. BURGAS BAY. SURVEY"}
+assert nw.read([named])["warnings"][0]["placedBy"] == "Burgas"
+nw.places["names"] = None
+
 print("ok")

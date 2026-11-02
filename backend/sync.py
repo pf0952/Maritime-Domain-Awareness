@@ -21,6 +21,7 @@ from xml.etree import ElementTree
 
 import numpy as np
 import shapely
+from pyogrio.errors import DataLayerError, DataSourceError
 
 import charts
 
@@ -31,6 +32,10 @@ LAND_URL = "https://naciscdn.org/naturalearth/"
 LAND_FILES = {
     "overview": "50m/physical/ne_50m_land",
     "lakes": "10m/physical/ne_10m_lakes",
+    # named places, for nav warnings that give no position (navwarnings.py)
+    "marine": "10m/physical/ne_10m_geography_marine_polys",
+    "ports": "10m/cultural/ne_10m_ports",
+    "places": "10m/cultural/ne_10m_populated_places_simple",
 }
 WORLD_ZOOM = 7  # below this the whole world shows as one piece; from here, tiles of OpenStreetMap's coast
 COAST = LAND / "coast"
@@ -41,8 +46,8 @@ COAST_SIMPLIFY = (0.003, 0.0006, 0.00012)  # degrees: under a pixel at each leve
 SEA = ENC.parent / "gebco"
 SEA_URL = "https://dap.ceda.ac.uk/bodc/gebco/global/gebco_2026/ice_surface_elevation/geotiff/gebco_2026_geotiff.zip"
 SEA_FILES = 8
-SEA_SIZES = (30, 10, 2.5, 0.625)  # degrees on a side of a tile of the world's seabed, at each level of detail
-SEA_ZOOMS = (5.5, 7.5, 9.5)  # the zoom each finer level comes in at
+SEA_SIZES = (60, 30, 10, 2.5, 0.625)  # degrees on a side of a tile of the world's seabed, at each level of detail
+SEA_ZOOMS = (3.5, 5.5, 7.5, 9.5)  # the zoom each finer level comes in at
 SEA_TILES = 16  # at most in a view, or it takes a coarser level
 SEA_CHUNK = 1024 * 1024
 UPLOADS = ENC.parent / "uploads"
@@ -56,6 +61,7 @@ WORKERS = max((os.cpu_count() or 2) - 1, 1)  # compiling at once
 POOLS = 3  # goes at compiling in parallel, before carrying on one chart at a time
 BACKLOG = 300  # charts left to compile: this many can wait behind the map; any more, and the loading screen shows
 LOWEST_TIER = 2  # the viewer's, zoomed all the way out: NOAA has retired most band 1 charts
+BUILDINGS_ZOOM = 10  # from here in, the viewer has buildings to stand somewhere
 COASTAL_BAND = 3  # charts from here up are drawn for the place they cover; coarser ones just span oceans and lakes
 
 VERSION = re.compile(rb"\.000\x1f(\d+)\x1f(\d+)\x1f")  # at the head of a base cell: its edition and update number
@@ -196,7 +202,12 @@ def uploaded_chart(path: Path) -> Chart:
 def take_uploads() -> None:
     """Puts the user's charts in with NOAA's. They go through all the same machinery, and win if they share a name."""
     global catalog
-    mine = [uploaded_chart(path) for path in sorted(UPLOADS.glob("*.000"))]
+    mine = []
+    for path in sorted(UPLOADS.glob("*.000")):
+        try:
+            mine.append(uploaded_chart(path))
+        except (ValueError, DataSourceError, DataLayerError) as e:  # a damaged one mustn't cost all of NOAA's
+            status["problem"] = f"Can't read the uploaded chart {path.name}: {e}"
     on_disk.update({c.name: c.version for c in mine})
     names = {c.name for c in mine}
     catalog = Catalog([c for c in noaa if c.name not in names] + mine)
@@ -406,6 +417,8 @@ def fetch_sea() -> None:
 def tile_bounds(name: str, sizes: tuple) -> tuple:
     level, x, y = map(int, name.split("_")[1:])
     size = sizes[level]
+    if not (level >= 0 and 0 <= x < 360 / size and 0 <= y < 180 / size):
+        raise ValueError(f"No tile {name}")
     return -180 + x * size, -90 + y * size, -180 + (x + 1) * size, -90 + (y + 1) * size
 
 
@@ -440,6 +453,18 @@ def sea_view(area: shapely.Geometry, zoom: float, covered: shapely.Geometry | No
 
 def sea_file(name: str) -> Path:
     return CACHE / f"{name}-{charts.SEA_FORMAT}.gz"
+
+
+def wanted_tile(file: Path) -> bool:
+    """Is a compiled file a tile of the seabed or the coast that could still be asked for?"""
+    name = file.stem.rsplit("-", 1)[0]
+    try:
+        if name.startswith("SEA_"):
+            sea_bounds(name)
+            return file == sea_file(name)
+        return name.startswith("COAST_") and any(file == land_file(name, t, catalog) for t in range(LOWEST_TIER, 7))
+    except (ValueError, IndexError):  # (one of some other shape)
+        return False
 
 
 def compile_all() -> None:
@@ -486,9 +511,7 @@ def compile_all() -> None:
         status["problem"] = f"{failed} of {status['total']} charts didn't compile: {error!r}"
     if catalog.charts:  # (with no catalog to go by, everything would look old)
         for old in CACHE.glob("*.gz"):  # older versions of charts
-            name = old.stem.rsplit("-", 1)[0]
-            coast = name.startswith("COAST_") and any(old == land_file(name, t, catalog) for t in range(LOWEST_TIER, 7))
-            if old not in files and old not in land and old != sea_file(name) and not coast:
+            if old not in files and old not in land and not wanted_tile(old):
                 old.unlink(missing_ok=True)
 
 

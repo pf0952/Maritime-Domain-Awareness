@@ -13,17 +13,19 @@ import math
 import re
 import threading
 import time
+import unicodedata
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pyogrio
 import shapely
 
 SITE = "https://www.sealagom.com"
 UKHO = "https://msi.admiralty.co.uk/RadioNavigationalWarnings"  # all of NAVAREA I and its coastal WZ warnings in force
 FEED_LIMIT = 100  # SeaLagom's feeds stop here, newest first, so one this long has probably lost its oldest warnings
 SAVED = Path(__file__).parent.parent / "enc" / "nav_warnings.json"
-FRESH = 3600  # s: they come out through the day, but not by the minute
+FRESH = 3600  # s: they come out through the day, but not by the minute. Read again every hour on the hour
 TIMEOUT = 30  # s
 PAUSE = 0.25  # s between feeds: one person runs this site
 NAVAREAS = range(1, 21)
@@ -37,6 +39,21 @@ METRES_PER_DEGREE = 111_320
 SAR_LIFE = 96 * 3600  # s after it's issued: a search ends, whatever the words say
 SEARCH = "Search and rescue"
 HALF_YEAR = 182 * 86400  # s
+PLACES = Path(__file__).parent.parent / "enc" / "land"  # (fetched with the land, by sync.py)
+PLACE_FILES = (
+    ("ne_10m_geography_marine_polys.zip", ("name", "namealt", "name_en", "name_es", "name_fr", "name_pt", "name_ru",
+                                           "name_tr", "name_zh")),
+    ("ne_10m_lakes.zip", ("name", "name_alt", "name_en")),
+    ("ne_10m_ports.zip", ("name",)),
+    ("ne_10m_populated_places_simple.zip", ("name", "nameascii")),
+)
+TOWN_SIZE = 50_000  # people: smaller towns' names are too often plain words as well
+SHORTEST_NAME = 4  # letters
+WIDEST_PLACE = 25  # square degrees: a warning placed over all of the Black Sea says nothing
+PLACE_SIMPLIFY = 0.01  # degrees
+FEED_MARGIN = 5  # degrees around where a feed's other warnings are
+NOT_PLACES = {"MOBILE", "SPLIT", "READING", "SALE", "ORDER", "UNION", "INDEPENDENCE", "PROGRESO", "LIBERTAD", "CENTRAL",
+              "VICTORIA", "SANTA", "SAN", "PORT", "LAKE", "BAY", "SEA", "NORTH", "SOUTH", "EAST", "WEST"}
 
 CATEGORIES = (
     ("Military", r"FIRING|GUNNERY|MISSILE|ROCKET|EXERCISE|MILITARY|NAVAL|MINES?|SUBMARINE OPERATIONS"),
@@ -67,8 +84,10 @@ ANGLE = (
     r"(\d{1,3})\s*[-°º]\s*(\d{1,2}(?:[.,]\d+)?)(?:\s*['′’]?\s*-?\s*(\d{2}(?:[.,]\d+)?)\s*[\"″”])?"
     r"(?:-(\d{2}(?:\.\d+)?))?\s*['′’]?\s*"
 )
-POSITION = re.compile(rf"(?<![\d.]){ANGLE}([NS])[\s.,/-]*(?:AND\s+)?{ANGLE}([EW])\b")
+# (not \b after the E or W: Chinese runs straight on, and its characters count as letters to \b)
+POSITION = re.compile(rf"(?<!\d)(?<!\d\.){ANGLE}([NS])[\s.,/-]*(?:AND\s+)?(?:LONG(?:ITUDE)?[.:]?\s*)?{ANGLE}([EW])(?![A-Z])")
 RUSSIAN = {"С": "N", "Ю": "S", "В": "E", "З": "W"}
+TURKISH = {"K": "N", "G": "S", "D": "E", "B": "W"}  # kuzey, güney, doğu, batı
 REACH = re.compile(rf"WITHIN\s+(\d+(?:\.\d+)?|{'|'.join(WORDS)})\s+(?:NAUTICAL\s+)?({'|'.join(METRES)})S?\b")
 LETTERED = re.compile(r"\n\s*[A-Z]{1,2}[.)]\s")
 AREA = re.compile(r"\bBOUNDED\b|\bBOUNDARY\b|\bAREAS?\b")
@@ -93,6 +112,8 @@ WARNING_ROW = re.compile(
 
 refreshing = threading.Lock()
 found = {"items": None, "checked": 0.0}
+latest = {"items": None, "answer": None}
+places = {"names": None, "longest": 0, "joined": []}
 
 
 def seconds(whole: str, minutes: str, marked: str, dashed: str) -> float:
@@ -105,9 +126,17 @@ def tidied(text: str) -> str:
     """The many ways authorities write a position, brought round to 56-32.5N, or 56-32-30N."""
     text = re.sub(r"[–—−]", "-", text).replace("〫", "°")
     text = re.sub(r"(\d)\s*([СЮВЗ])(?![А-Я])", lambda found: found[1] + RUSSIAN[found[2]], text)
-    minutes = r"(\d{2}(?:\.\d+)?)"
-    text = re.sub(rf"(?<![\d.-])(\d{{1,3}}) +{minutes} +{minutes}\s*([NSEW])\b", r"\1-\2-\3\4", text)
-    return re.sub(rf"(?<![\d.-])(\d{{1,3}}) +{minutes}\s*([NSEW])\b", r"\1-\2\3", text)
+    text = re.sub(r"(\d)=(\d)", r"\1-\2", text)  # (a slip for a dash, now and then)
+    minutes = r"(\d{2}(?:[.,]\d+)?)"
+    text = re.sub(  # Turkish: 36 38.88 K - 028 03.69 D
+        rf"(?<![\d.-])(\d{{1,3}} +{minutes}) *([KG])( *[-,] *)(\d{{1,3}} +{minutes}) *([DB])(?![A-ZÇĞİÖŞÜ])",
+        lambda f: f"{f[1]}{TURKISH[f[3]]}{f[4]}{f[5]}{TURKISH[f[7]]}",
+        text,
+    )
+    # (after a dash only when it follows a latitude: 34 40.7N-033 15.4E)
+    start = r"(?<![\d.])(?<!\d-)(?<![\d.]-)"
+    text = re.sub(rf"{start}(\d{{1,3}}) +{minutes} +{minutes}\s*([NSEW])(?![A-Z])", r"\1-\2-\3\4", text)
+    return re.sub(rf"{start}(\d{{1,3}}) +{minutes}\s*([NSEW])(?![A-Z])", r"\1-\2\3", text)
 
 
 def positions(text: str) -> list:
@@ -170,6 +199,60 @@ def shapes(text: str) -> list:
     if around:
         return [{"ring": ring_around([point], around)} for point in every]
     return [{"point": [round(lon, 4), round(lat, 4)]} for lon, lat in every]
+
+
+def plain(text: str) -> str:
+    """Upper case letters and digits, single spaced, accents gone: how names and warnings are matched."""
+    text = unicodedata.normalize("NFKD", text.upper()).replace("İ", "I")
+    return " ".join(re.sub(r"[^\w]+", " ", "".join(c for c in text if not unicodedata.combining(c))).split())
+
+
+def gazetteer() -> dict:
+    """Natural Earth's named seas, bays, straits, lakes, ports and towns: plain name: (shape, area in square degrees)."""
+    names = {}
+    for file, fields in PLACE_FILES:
+        path = PLACES / file
+        if not path.exists():
+            continue
+        table = pyogrio.read_dataframe(path, columns=[*fields, *(["pop_max"] if "places" in file else [])])
+        for row in table.itertuples():
+            shape = shapely.make_valid(row.geometry)
+            if shape.is_empty or "places" in file and (row.pop_max or 0) < TOWN_SIZE:
+                continue
+            for field in fields:
+                value = getattr(row, field)
+                name = plain(value) if isinstance(value, str) else ""  # (an empty one comes as NaN)
+                if len(name) >= (SHORTEST_NAME if name.isascii() else 2) and name not in NOT_PLACES and shape.area <= WIDEST_PLACE:
+                    if name not in names or shape.area < names[name][1]:
+                        names[name] = (shape, shape.area)
+    return names
+
+
+def named_place(text: str, near: tuple | None) -> tuple | None:
+    """The smallest place a warning names, as (name, shape), from words alone: when it gives no position. Only one
+    near where the rest of its feed's warnings are, if they say, as many names are found the world over."""
+    if not places["names"]:  # (and again until sync.py has fetched the files, the first time)
+        places["names"] = gazetteer()
+        places["longest"] = max((n.count(" ") + 1 for n in places["names"]), default=0)
+        places["joined"] = [n for n in places["names"] if not n.isascii()]  # Chinese and such: no spaces to go by
+    names, spaced = places["names"], f" {plain(text)} "
+    words = spaced.split()
+    found = {" ".join(words[i : i + n]) for n in range(1, places["longest"] + 1) for i in range(len(words) - n + 1)}
+    found = {n for n in found if n in names} | {n for n in places["joined"] if n in text}
+    if near:
+        found = {n for n in found if names[n][0].intersects(shapely.box(*near))}
+    # the smallest, and of the same size the last named: warnings start with the sea and end with the harbour
+    last = lambda n: max(spaced.rfind(f" {n} "), text.rfind(n))  # noqa: E731
+    best = min(found, key=lambda n: (names[n][1], -last(n)), default=None)
+    return (best, names[best][0]) if best else None
+
+
+def place_shape(shape: shapely.Geometry) -> dict:
+    if shape.area == 0:
+        point = shape.representative_point()
+        return {"point": [round(point.x, 4), round(point.y, 4)]}
+    biggest = max(shapely.get_parts(shape), key=lambda part: part.area)
+    return {"ring": shapely.get_coordinates(biggest.exterior.simplify(PLACE_SIMPLIFY)).round(4).tolist()}
 
 
 def category(text: str) -> str:
@@ -288,7 +371,7 @@ def source(item: dict) -> str:
 
 def read(items: list) -> dict:
     """Saved warnings still in force, as the viewer wants them: each one once, however many feeds carried it."""
-    warnings, unplaced = {}, 0
+    warnings, by_name, spread = {}, [], collections.defaultdict(list)
     now = time.time()
     for item in items:
         if item["url"] in warnings:
@@ -300,11 +383,7 @@ def read(items: list) -> dict:
             end = min(end or math.inf, item["issued"] + SAR_LIFE)
         if end and end < now:
             continue
-        where = shapes(text)
-        if not where:
-            unplaced += 1
-            continue
-        warnings[item["url"]] = {
+        warnings[item["url"]] = warning = {
             "id": item["title"],
             "url": item["url"],
             "source": source(item),
@@ -312,19 +391,63 @@ def read(items: list) -> dict:
             "issued": item["issued"],
             "ends": end,
             "text": item["text"],
-            "shapes": where,
+            "shapes": shapes(text),
         }
+        if warning["shapes"]:
+            spread[item["feed"]] += [p for s in warning["shapes"] for p in s.get("ring", [s.get("point")])]
+        else:
+            by_name.append((item["feed"], warning))
+    # then those with no position, by the places they name
+    unplaced = 0
+    for feed, warning in by_name:
+        near = None
+        if len(spread[feed]) >= 3:
+            lons, lats = zip(*spread[feed])
+            near = (min(lons) - FEED_MARGIN, min(lats) - FEED_MARGIN, max(lons) + FEED_MARGIN, max(lats) + FEED_MARGIN)
+        place = named_place(warning["text"].upper(), near)
+        if place:
+            warning.update(shapes=[place_shape(place[1])], placedBy=place[0].title())
+        else:
+            del warnings[warning["url"]]
+            unplaced += 1
     counts = collections.Counter(item["feed"] for item in items)
     full = [feed for feed, count in counts.items() if count >= FEED_LIMIT and feed != "ukho"]
     return {"warnings": list(warnings.values()), "unplaced": unplaced, "cut": full}
 
 
-def current() -> dict:
-    """What we have now, starting a look for newer ones if it's due."""
-    if found["items"] is None and SAVED.exists():
+def read_found() -> None:
+    if found["items"] is not None and latest["items"] is not found["items"]:
+        latest.update(items=found["items"], answer=read(found["items"]))
+
+
+def run() -> None:
+    """At startup, the saved warnings are placed, and the feeds read if those are old; then the feeds are read again
+    every hour, on the hour."""
+    if SAVED.exists():
         found.update(items=json.loads(SAVED.read_text(encoding="utf-8")), checked=SAVED.stat().st_mtime)
-    if time.time() - found["checked"] > FRESH and refreshing.acquire(blocking=False):
-        threading.Thread(target=refresh, daemon=True).start()
-    if found["items"] is None:
-        return {"warnings": [], "unplaced": 0, "cut": [], "checked": None, "loading": True}
-    return {**read(found["items"]), "checked": found["checked"], "loading": False}
+        read_found()
+    due = time.time() - found["checked"] > FRESH
+    while True:
+        try:
+            if due and refreshing.acquire(blocking=False):
+                refresh()
+            read_found()
+        except Exception:  # whatever it was, the warnings we have stand, and the next hour tries again
+            pass
+        found["tried"] = True
+        time.sleep(FRESH - time.time() % FRESH)  # (an hour's seconds go evenly into a day's, so this is :00)
+        due = True
+
+
+def ready() -> bool:
+    """Placed, or tried: the viewer opens with them, or without them if the feeds can't be reached."""
+    return latest["answer"] is not None or found.get("tried", False)
+
+
+def current() -> dict:
+    """What we have now, less any that have run out since."""
+    if latest["answer"] is None:
+        return {"warnings": [], "unplaced": 0, "cut": [], "checked": None, "loading": not found.get("tried")}
+    now = time.time()
+    warnings = [w for w in latest["answer"]["warnings"] if not w["ends"] or w["ends"] >= now]
+    return {**latest["answer"], "warnings": warnings, "checked": found["checked"], "loading": False}

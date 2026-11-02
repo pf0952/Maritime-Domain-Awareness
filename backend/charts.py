@@ -25,10 +25,12 @@ from numpy.lib.stride_tricks import sliding_window_view
 from rasterio.windows import Window
 
 FORMAT = 4  # raise it when these files change: browsers and backend/cache keep them for good
-LAND_FORMAT = 3  # the same, for the world's land
-SEA_FORMAT = 3  # the same, for the world's seabed
+LAND_FORMAT = 4  # the same, for the world's land
+SEA_FORMAT = 4  # the same, for the world's seabed
 WIDE = 3  # degrees: a chart wider or taller than this isn't offsets from its middle, as they bend, and neighbours part
 SEA_GRID = 150  # squares across a tile of it
+SEA_WORLD_GRID = 100  # across one of the tiles the whole world is seen in, each a CPU's frame in itself at the full count
+SEA_WORLD_TILE = 60  # degrees
 SEA_CELLS = 240  # to the degree, in GEBCO's grid
 SEA_PART = 90 * SEA_CELLS  # cells on a side of each of its files
 TOLERANCE = 0.2e-3 / 111_000  # degrees per unit of chart scale: 0.2 mm on the chart, finer than it can show
@@ -457,7 +459,7 @@ def world_outline(land: Path) -> str:
 
 
 def only_polygons(shapes: np.ndarray) -> np.ndarray:
-    parts = shapely.get_parts(shapes)
+    parts = shapely.get_parts(shapely.get_parts(shapes))  # twice: a collection can hold multipolygons
     parts = parts[shapely.get_type_id(parts) == shapely.GeometryType.POLYGON]
     return parts[~shapely.is_empty(parts)]
 
@@ -597,16 +599,17 @@ def compile_sea(folder: Path, bounds: tuple, out: Path) -> None:
     exactly. Land stays in, at the waterline: it lies under the world's land, and shows as shallows where a finer coast
     than GEBCO's opens water there, as in docks."""
     west, south, east, north = bounds
-    step = round((east - west) * SEA_CELLS / SEA_GRID)
-    steps = step * np.arange(SEA_GRID + 1)
+    grid = SEA_WORLD_GRID if east - west >= SEA_WORLD_TILE else SEA_GRID
+    step = round((east - west) * SEA_CELLS / grid)
+    steps = step * np.arange(grid + 1)
     columns = (round((west + 180) * SEA_CELLS) + steps) % (360 * SEA_CELLS)
     rows = np.minimum(round((90 - north) * SEA_CELLS) + steps, 180 * SEA_CELLS - 1)
     heights = gebco_heights(folder, columns, rows).astype(float).ravel()
-    corners = np.arange((SEA_GRID + 1) ** 2).reshape(SEA_GRID + 1, SEA_GRID + 1)
+    corners = np.arange((grid + 1) ** 2).reshape(grid + 1, grid + 1)
     a, b, c, d = corners[:-1, :-1], corners[:-1, 1:], corners[1:, :-1], corners[1:, 1:]
     triangles = np.stack([a, c, b, b, c, d], axis=-1).reshape(-1, 3)
     used, triangles = np.unique(triangles, return_inverse=True)
-    lon, lat = np.meshgrid(np.linspace(west, east, SEA_GRID + 1), np.linspace(north, south, SEA_GRID + 1))
+    lon, lat = np.meshgrid(np.linspace(west, east, grid + 1), np.linspace(north, south, grid + 1))
     positions = np.column_stack([lon.ravel()[used], lat.ravel()[used], np.minimum(heights[used], 0)])
     mesh = positions, colour(-positions[:, 2]), triangles.ravel()
     # (only the finest level needs offsets, for the zooms it shows at)

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import shapely
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +37,7 @@ search_turn = threading.Lock()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     threading.Thread(target=sync.run, daemon=True).start()
+    threading.Thread(target=navwarnings.run, daemon=True).start()
     if os.environ.get("ENC_OPEN_BROWSER"):  # (start.bat)
         threading.Timer(1, webbrowser.open, ["http://127.0.0.1:8000"]).start()
     yield
@@ -50,12 +51,18 @@ def upload_summary(chart: sync.Chart) -> dict:
     return {"name": chart.name, "scale": chart.scale, "bounds": chart.cover.bounds}
 
 
+def same_site(origin: str | None = Header(None), host: str | None = Header(None)) -> None:
+    """Any web page open in the browser can send to this address, so only our own may change what's stored."""
+    if origin and urllib.parse.urlparse(origin).netloc != host:
+        raise HTTPException(403, "Only the viewer itself can change uploads")
+
+
 @app.get("/api/uploads")
 def get_uploads():
     return [upload_summary(c) for c in sync.catalog.charts if c.url is None]
 
 
-@app.post("/api/uploads")
+@app.post("/api/uploads", dependencies=[Depends(same_site)])
 def add_upload(file: UploadFile):
     name = Path(file.filename or "").name
     if not name.lower().endswith(".000"):
@@ -72,7 +79,7 @@ def add_upload(file: UploadFile):
             raise HTTPException(422, f"{name} isn't a readable S-57 cell")
 
 
-@app.delete("/api/uploads/{name}")
+@app.delete("/api/uploads/{name}", dependencies=[Depends(same_site)])
 def delete_upload(name: str):
     chart = sync.catalog.by_name.get(name)
     if chart is None or chart.url is not None:
@@ -88,7 +95,10 @@ def get_warnings():
 
 @app.get("/api/status")
 def get_status():
-    return {**sync.status, "charts": len(sync.on_disk)}
+    status = {**sync.status, "charts": len(sync.on_disk)}
+    if status["ready"] and not navwarnings.ready():  # the nav warnings are placed as part of opening, too
+        status.update(ready=False, phase="warnings")
+    return status
 
 
 @app.get("/api/view")
@@ -100,7 +110,10 @@ def get_view(west: float, south: float, east: float, north: float, tier: int, co
     around it reaches well past what's on screen."""
     catalog = sync.catalog
     area = sync.on_the_map(shapely.box(west, south, east, north))
-    screen = shapely.Polygon(np.array(corners.split(","), dtype=float).reshape(-1, 2))
+    try:
+        screen = shapely.Polygon(np.array(corners.split(","), dtype=float).reshape(-1, 2))
+    except ValueError:
+        raise HTTPException(422, "corners must be lng,lat pairs, four or more")
     in_sight = sync.on_the_map(shapely.make_valid(screen))
     land = [(name, tier, sync.land_file(name, tier, catalog)) for name in sync.land_view(area, zoom, catalog)]
     picked = [(c.name, tier, sync.chart_file(c, tier, catalog)) for c in reversed(catalog.pick(area, tier))]
@@ -108,11 +121,13 @@ def get_view(west: float, south: float, east: float, north: float, tier: int, co
     # last, as charts hide it and hidden costs less, and none at all of what they hide completely
     sea = [(name, 0, sync.sea_file(name)) for name in sync.sea_view(area, zoom, covered)]
     pieces = [{"name": name, "tier": t, "key": file.stem} for name, t, file in land + picked + sea]
-    charts_here = catalog.over(in_sight)
-    detailed = [c.cover.bounds for c in charts_here if c.band >= sync.COASTAL_BAND]
-    # beyond the charts OpenStreetMap draws both the coast and the buildings, so they agree
-    uncharted = in_sight.difference(shapely.union_all([c.cover for c in charts_here]))
-    detailed += [part.bounds for part in shapely.get_parts(uncharted) if not part.is_empty]
+    detailed = []
+    if zoom >= sync.BUILDINGS_ZOOM:  # (from further out it's thousands of charts, for no buildings to stand)
+        charts_here = catalog.over(in_sight)
+        detailed = [c.cover.bounds for c in charts_here if c.band >= sync.COASTAL_BAND]
+        # beyond the charts OpenStreetMap draws both the coast and the buildings, so they agree
+        uncharted = in_sight.difference(shapely.union_all([c.cover for c in charts_here]))
+        detailed += [part.bounds for part in shapely.get_parts(uncharted) if not part.is_empty]
     return {"charted": sync.charted(in_sight, catalog), "detailed": detailed, "pieces": pieces}
 
 
@@ -124,7 +139,7 @@ def get_tide(lat: float, lon: float):
         if station is None:
             return {"station": None}
         return {"station": {**station, "km": round(km, 1)}, **tides.series(station)}
-    except OSError as e:
+    except (OSError, ValueError) as e:  # (a half-sent answer doesn't parse)
         raise HTTPException(503, f"No tide data just now: {e}")
 
 
@@ -147,7 +162,7 @@ def get_search(q: str = Query(min_length=1, max_length=200)):
             with urllib.request.urlopen(request, timeout=sync.TIMEOUT) as res:
                 rows = json.load(res)
             time.sleep(1)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         raise HTTPException(503, f"Search isn't available just now: {e}")
     return places_from(rows)
 
