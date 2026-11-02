@@ -73,8 +73,8 @@ assert across.bounds == (-180, 50, 180, 52) and abs(across.area - 20) < 1e-9
 assert view(-71.1 + 360, 42.3, -70.9 + 360, 42.4)["charted"]
 assert view(-71.1 - 720, 42.3, -70.9 - 720, 42.4)["charted"]
 across = view(175, 50, 190, 54)  # the Aleutians, from one side of the date line to the other
-tiles = {p["name"] for p in across["pieces"]}
-assert {"LAND_170_50", "LAND_-180_50"} <= tiles and across["charted"]
+assert {"COAST_0_35_14", "COAST_0_0_14"} <= set(sync.land_view(sync.on_the_map(shapely.box(175, 50, 190, 54)), 7.5, catalog))
+assert across["charted"]
 
 # search answers arrive as south, north, west, east, in text
 assert main.places_from([{"display_name": "Freeport", "boundingbox": ["26.4", "26.6", "-78.8", "-78.6"]}]) == [
@@ -92,7 +92,7 @@ inland = "-105.1,39.8,-104.9,39.8,-104.9,39.6,-105.1,39.6"
 assert not view(-105.1, 39.6, -70.9, 42.4, corners=inland)["charted"]
 
 # the world's land only gives way to charts that are showing, or a coarser view would have holes in it
-assert sync.land_file("LAND_-80_40", 5, catalog) != sync.land_file("LAND_-80_40", 2, catalog)
+assert sync.land_file("COAST_0_10_13", 5, catalog) != sync.land_file("COAST_0_10_13", 2, catalog)
 assert len(sync.land_cut("WORLD", 0, catalog)) == 0
 
 # the general map's outline stays on its 360 wide square, and small enough to send
@@ -102,8 +102,8 @@ assert 2000 < len(numbers) and 0 <= min(numbers) and max(numbers) <= 360 and len
 
 # it shows as one piece from far out, then as the tiles in view
 assert sync.land_view(shapely.box(-120, 20, -60, 50), 3, catalog) == ["WORLD"]
-assert sync.land_view(harbour, 9, catalog) == ["LAND_-80_40"]
-assert len(sync.land_tiles()) == 36 * 18 + 1
+assert all(name.startswith("COAST_1_") for name in sync.land_view(harbour, 9, catalog))
+assert sync.land_bounds("COAST_0_10_13") == (-80, 40, -70, 50)
 
 
 class DeadPool:
@@ -129,19 +129,19 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # and it stops where charts begin: their land is the better drawn
     file = sync.CACHE / "land.gz"
-    function, *args = sync.land_job("LAND_-80_40", 5, file, catalog)
+    function, *args = sync.land_job("COAST_0_10_13", 5, file, catalog)
     function(*args)
     data = gzip.decompress(file.read_bytes())
     size = struct.unpack("<I", data[:4])[0]
     head = json.loads(data[4 : 4 + size])
     vertices = head["meshes"]["land"][0]
     assert vertices and all(head["meshes"][key][0] for key in ("landWalls", "coast", "outline"))
-    xy = np.frombuffer(data, "<f4", vertices * 3, 4 + size).reshape(-1, 3)[:, :2] + head["origin"]
+    xy = np.frombuffer(data, "<f4", vertices * 3, 4 + size).reshape(-1, 3)[:, :2] + (head["origin"] or [0, 0])
     assert (np.abs(xy[:, 0] + 75) <= 5.01).all() and (np.abs(xy[:, 1] - 45) <= 5.01).all()
     assert not shapely.contains_xy(shapely.buffer(fine.cover, -1e-3), xy).any()
 
-    # (from here on the world's land would just be hundreds of tiles compiled for nothing)
-    sync.land_tiles = lambda: {}
+    # (from here on the world's land would just be compiled for nothing)
+    sync.land_source, sync.LAND_FILES = lambda key: Path(tmp) / "no land", {}
 
     # a pool that dies loses nothing: the jobs finish one at a time
     lost = sync.chart_file(fine, 5, catalog)
@@ -203,4 +203,51 @@ with tempfile.TemporaryDirectory() as tmp:
     (Path(tmp) / "ENCProdCat.xml").write_text(ONE_CELL)
     sync.check()
     assert [c.name for c in sync.catalog.charts] == ["US5TEST1"] and sync.status["problem"]
+
+# the user's own charts join the catalog, last through a restart, and give NOAA's back when removed
+real = Path(__file__).parent.parent / "enc/ENC_ROOT/US5BOSCD/US5BOSCD.000"
+client = TestClient(main.app)
+assert sync.Chart("GBX", 12000, (1, 0), None, None, "").band == 5, "a cell not named by its band"
+with tempfile.TemporaryDirectory() as tmp:
+    sync.UPLOADS, sync.ENC, sync.noaa = Path(tmp) / "uploads", Path(tmp) / "ENC_ROOT", []
+    sync.on_disk.clear()
+    answer = client.post("/api/uploads", files={"file": ("mine.000", real.read_bytes())}).json()
+    assert answer["name"] == "US5BOSCD" and answer["scale"]
+    chart = sync.catalog.by_name["US5BOSCD"]
+    assert chart.url is None and sync.cell_path(chart).exists() and sync.on_disk[chart.name] == chart.version
+    assert sync.catalog.over(chart.cover) == [chart] and chart.band == 5
+    assert chart.cover.area < shapely.box(*chart.cover.bounds).area * 1.01
+    sync.catalog = sync.Catalog([])
+    sync.take_uploads()
+    assert client.get("/api/uploads").json()[0]["name"] == "US5BOSCD", "lost on restart"
+    assert client.delete("/api/uploads/US5NYCXI").status_code == 404
+    assert client.delete("/api/uploads/US5BOSCD").status_code == 200
+    assert not sync.catalog.charts and not list(sync.UPLOADS.iterdir())
+
+# the world's seabed: neighbouring tiles share their edge exactly, and a view stays within its number of tiles
+if sync.have_sea():
+    with tempfile.TemporaryDirectory() as tmp:
+        tiles = {}
+        for name in ("SEA_2_1_60", "SEA_2_2_60", "SEA_2_143_60", "SEA_2_0_60", "SEA_2_35_60", "SEA_2_36_60"):  # (Pacific,
+            out = Path(tmp) / f"{name}.gz"  # the date line, and where two of GEBCO's files meet)
+            charts.compile_sea(sync.SEA, sync.sea_bounds(name), out)
+            size = struct.unpack("<I", gzip.decompress(out.read_bytes())[:4])[0]
+            data = gzip.decompress(out.read_bytes())
+            head = json.loads(data[4 : 4 + size])
+            vertices, triangles = head["meshes"]["waterBase"]
+            xyz = np.frombuffer(data, "<f4", vertices * 3, 4 + size).reshape(-1, 3)
+            assert triangles and (xyz[:, 2] <= 0).all()
+            tiles[name] = xyz
+
+        def edge(xyz: np.ndarray, lon: float) -> np.ndarray:
+            line = xyz[np.abs(xyz[:, 0] - lon) < 1e-3]
+            return line[np.argsort(line[:, 1]), 2]
+
+        for left, right, lon in (("SEA_2_1_60", "SEA_2_2_60", -175), ("SEA_2_35_60", "SEA_2_36_60", -90)):
+            assert len(edge(tiles[left], lon)) and (edge(tiles[left], lon) == edge(tiles[right], lon)).all(), lon
+        assert (edge(tiles["SEA_2_143_60"], 180) == edge(tiles["SEA_2_0_60"], -180)).all(), "date line"
+    assert len(sync.sea_view(shapely.box(-180, -85, 180, 85), 12)) <= 144
+    assert all(name.startswith("SEA_0") for name in sync.sea_view(shapely.box(-180, -85, 180, 85), 12))
+    assert all(name.startswith("SEA_3") for name in sync.sea_view(shapely.box(-70.1, 42, -70, 42.1), 12))
+    assert all(name.startswith("SEA_1") for name in sync.sea_view(shapely.box(-70.1, 42, -70, 42.1), 6))
 print("ok")

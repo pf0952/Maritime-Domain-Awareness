@@ -45,6 +45,8 @@ const WARNING_DOT_PICKED = 8
 const WARNING_DOT_BELOW = 14 // px: a box smaller than this on screen gets a dot as well, or it couldn't be seen or hit
 const WARNING_REACH = 14 // px: how near a dot or a box's edge a click counts
 const WARNINGS_RETRY = 15000 // ms: while the first ever look through the feeds is going on
+const GREY_AFTER = 250 // ms of loading before the screen greys, or every small pan would flash
+const UNGREY_AFTER = 150 // ms of quiet before it clears, as one thing's end can come just before the next one's start
 const WARNING_CATEGORIES = {
   Military: [239, 68, 68],
   'Search and rescue': [249, 115, 22],
@@ -284,13 +286,14 @@ const TIDE_UNIFORMS = `layout(std140) uniform tideUniforms {
   float sunLat;
   float sunLon;
   float lit;
+  float behind;
 } tide;`
 const tideModule = {
   name: 'tide',
   vs: TIDE_UNIFORMS,
   fs: TIDE_UNIFORMS,
   uniformTypes: Object.fromEntries(
-    'level seabed contours shallow safety deep originX originY sunLat sunLon lit'.split(' ').map((name) => [name, 'f32']),
+    'level seabed contours shallow safety deep originX originY sunLat sunLon lit behind'.split(' ').map((name) => [name, 'f32']),
   ),
 }
 
@@ -312,6 +315,9 @@ void main() {
   float sun = tide.sunLat * RADIANS;
   sunUp = sin(lat) * sin(sun) + cos(lat) * cos(sun) * cos(lon);
   gl_Position = project_position_to_clipspace(positions, vec3(0.0), vec3(0.0));
+  // squeezed into the far end of the depth range, in order: anything a chart draws is in front of all of this, however
+  // deep, so a chart overwrites the world's seabed wherever it reaches, without either being cut to fit
+  if (tide.behind > 0.5) gl_Position.z = gl_Position.z * 0.01 + gl_Position.w * 0.99;
 }`
 const FRAGMENT_SHADER = `#version 300 es
 precision highp float;
@@ -378,9 +384,10 @@ class Mesh extends Layer {
 
   draw() {
     const { model } = this.state
-    const { level, seabed, contours, sun, coordinateOrigin } = this.props
+    const { level, seabed, behind, contours, sun, coordinateOrigin } = this.props
     const [originX, originY] = coordinateOrigin
-    model.shaderInputs.setProps({ tide: { level, seabed: seabed ? 1 : 0, ...contours, ...sun, originX, originY } })
+    const tide = { level, seabed: seabed ? 1 : 0, behind: behind ? 1 : 0, ...contours, ...sun, originX, originY }
+    model.shaderInputs.setProps({ tide })
     model.draw(this.context.renderPass)
   }
 
@@ -408,9 +415,12 @@ function chartLayers(chart, show, zoom, level, contours, sun) {
       level,
       // walls take the depth colours but no lines: a chart's edge hangs through every depth, and would draw them all
       contours:
-        key === 'water' ? contours : { ...contours, contours: key === 'waterWalls' && contours.contours === 2 ? 3 : 0 },
+        key === 'water' || key === 'waterBase'
+          ? contours
+          : { ...contours, contours: key === 'waterWalls' && contours.contours === 2 ? 3 : 0 },
       sun,
       seabed: key.startsWith('water'),
+      behind: key === 'waterBase' || key === 'waterSea',
       // (the world as a whole is too big to be offsets from anywhere)
       coordinateSystem: chart.origin ? COORDINATE_SYSTEM.LNGLAT_OFFSETS : COORDINATE_SYSTEM.LNGLAT,
       coordinateOrigin: chart.origin ? [...chart.origin, 0] : [0, 0, 0],
@@ -419,6 +429,7 @@ function chartLayers(chart, show, zoom, level, contours, sun) {
     })
   return [
     mesh('waterSea', true),
+    mesh('waterBase', show.depare),
     mesh('water', show.depare),
     mesh('waterWalls', show.depare),
     mesh('land', show.lndare),
@@ -444,6 +455,8 @@ function syncMessage(sync) {
   const { phase, done, total, charts, problem } = sync
   if (phase === 'downloading' && total > 0) return `Downloading charts: ${done.toLocaleString()} of ${total.toLocaleString()}`
   if (phase === 'compiling' && total > 0) return `Preparing charts: ${done.toLocaleString()} of ${total.toLocaleString()}`
+  if (phase === 'coast') return "Downloading the world's coast: 1 GB, the first time only"
+  if (phase === 'seabed') return "Downloading the world's seabed: 4 GB, the first time only"
   if (phase === 'checking' || phase === 'starting') return 'Checking NOAA for updates'
   return `${charts.toLocaleString()} charts${problem ? '' : ', up to date'}`
 }
@@ -608,10 +621,12 @@ export default function App() {
   const cube = useRef(null)
   const overview = useRef(null)
   const footprint = useRef(null)
-  const uploaded = useRef([]) // the same as charts, for the map's own handlers
   const [shown, setShown] = useState([]) // the charts in view
   const [charts, setCharts] = useState([]) // the ones uploaded
   const [loading, setLoading] = useState(false)
+  const [tideAsked, setTideAsked] = useState(false) // only the first time: after that the last levels stand meanwhile
+  const [skylineLoading, setSkylineLoading] = useState(false)
+  const [grey, setGrey] = useState(false)
   const [sync, setSync] = useState(null)
   const [ready, setReady] = useState(false)
   const [zoom, setZoom] = useState(0)
@@ -727,28 +742,34 @@ export default function App() {
     async function loadTide() {
       tideRequest?.abort() // a slow answer for the last place mustn't land on top of this one
       tideRequest = new AbortController()
+      const { signal } = tideRequest
       const { lat, lng } = m.getCenter().wrap()
       try {
-        const res = await fetch(`/api/tide?lat=${lat}&lon=${lng}`, { signal: tideRequest.signal })
+        const res = await fetch(`/api/tide?lat=${lat}&lon=${lng}`, { signal })
         if (res.ok) setTide(await res.json())
       } catch {
         // the last levels stand until the next try
       }
+      if (!signal.aborted) setTideAsked(true)
     }
     const tideTimer = setInterval(loadTide, TIDE_REFRESH)
 
     const skyline = new Map() // tile: its buildings
     let skylineRequest = null
+    let skylineDrawn = '' // redrawing unchanged buildings would leave the map loading after every small pan
 
     async function loadSkyline(detailed) {
       skylineRequest?.abort()
+      setSkylineLoading(false)
       const zoom = m.getZoom()
       if (zoom < SKYLINE_ZOOM || zoom >= BUILDINGS_ZOOM) return
       skylineRequest = new AbortController()
       const { signal } = skylineRequest
       const tiles = skylineTiles(m, detailed)
       const url = m.getSource('protomaps')?.tiles?.[0]
-      if (!url) return
+      const names = tiles.map(({ x, y }) => `${x}/${y}`).join()
+      if (!url || names === skylineDrawn) return
+      setSkylineLoading(true)
       try {
         await Promise.all(
           tiles
@@ -772,6 +793,8 @@ export default function App() {
       }
       const features = tiles.flatMap(({ x, y }) => skyline.get(`${x}/${y}`) ?? [])
       m.getSource('skyline')?.setData({ ...EMPTY, features })
+      skylineDrawn = names
+      setSkylineLoading(false)
       for (const key of skyline.keys()) {
         if (skyline.size > SKYLINE_KEPT) skyline.delete(key)
       }
@@ -812,11 +835,9 @@ export default function App() {
       loadTide()
       try {
         const { charted: noaa, detailed: fine, pieces: want } = await (await fetch(`/api/view?${query}`, { signal })).json()
-        const inView = (box) => [-360, 0, 360].some((k) => overlaps(west + k, south, east + k, north)(box))
-        const mine = uploaded.current.map((c) => c.bounds).filter(inView)
-        setCharted(noaa || mine.length > 0)
-        setDetailed(fine.length + mine.length > 0)
-        loadSkyline([...fine, ...mine])
+        setCharted(noaa)
+        setDetailed(fine.length > 0)
+        loadSkyline(fine)
         const missing = want.filter((c) => !have.has(c.key))
         setLoading(missing.length > 0)
         await Promise.all(
@@ -900,6 +921,13 @@ export default function App() {
     refresh.current?.()
   }, [sync?.revision])
 
+  const warningsLoading = show.warnings && (!warnings || warnings.loading)
+  const busy = loading || skylineLoading || warningsLoading || (show.tide && !tideAsked) || !!compiling
+  useEffect(() => {
+    const timer = setTimeout(() => setGrey(busy), busy ? GREY_AFTER : UNGREY_AFTER)
+    return () => clearTimeout(timer)
+  }, [busy])
+
   // with the tide bar off, the water stands at chart datum, as on a paper chart
   const level = (show.tide && tide?.levels?.[hour + TIDE_HOURS]) || 0
 
@@ -938,7 +966,7 @@ export default function App() {
   }, [warnings])
 
   useEffect(() => {
-    const data = [...shown, ...charts]
+    const data = shown
     const contours = { contours: contourMode, shallow, safety, deep }
     const sun = { sunLat, sunLon, lit }
     const { boxes, dots } = warningShapes(warningsDrawn, zoom)
@@ -979,7 +1007,7 @@ export default function App() {
     overlay.current?.setProps({
       layers: [new Charts({ id: 'charts', beforeId: SKYLINE.id, data, show, zoom, level, contours, sun }), boxLayer, dotLayer],
     })
-  }, [shown, charts, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready])
+  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready])
 
   useEffect(() => {
     // they're only there to go with charts, and a coarse chart's coast would leave them standing in the water
@@ -989,6 +1017,13 @@ export default function App() {
     }
   }, [show.buildings, detailed])
 
+  useEffect(() => {
+    fetch('/api/uploads')
+      .then((res) => res.json())
+      .then(setCharts)
+      .catch(() => {}) // the list stays empty; the charts themselves still show
+  }, [])
+
   async function upload(files) {
     setError('')
     for (const file of files) {
@@ -996,19 +1031,26 @@ export default function App() {
       try {
         const body = new FormData()
         body.append('file', file)
-        const res = await fetch('/api/compile', { method: 'POST', body })
+        const res = await fetch('/api/uploads', { method: 'POST', body })
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail ?? `${file.name} failed to compile`)
-        const chart = unpack(await res.arrayBuffer())
-        // coarsest first, so finer charts draw over them
-        uploaded.current = [...uploaded.current.filter((c) => c.name !== chart.name), { id: chart.name, ...chart }]
-        setCharts([...uploaded.current].sort((a, b) => b.scale - a.scale))
+        const chart = await res.json()
+        setCharts((list) => [...list.filter((c) => c.name !== chart.name), chart].sort((a, b) => b.scale - a.scale))
         const [w, s, e, n] = chart.bounds
         map.current.fitBounds([[w, s], [e, n]], { pitch: 50, padding: { top: 60, bottom: 60, left: 320, right: 60 } })
+        refresh.current()
       } catch (e) {
         setError(e.message)
       }
     }
     setCompiling('')
+  }
+
+  async function removeUpload(name) {
+    setError('')
+    const res = await fetch(`/api/uploads/${encodeURIComponent(name)}`, { method: 'DELETE' }).catch(() => null)
+    if (!res?.ok) return setError(`${name} couldn't be removed`)
+    setCharts((list) => list.filter((c) => c.name !== name))
+    refresh.current()
   }
 
   if (!ready) return <LoadingScreen sync={sync} />
@@ -1206,15 +1248,23 @@ export default function App() {
           {charts.length > 0 && (
             <ul className="flex flex-col gap-1">
               {charts.map((c) => (
-                <li key={c.name} className="flex justify-between gap-2">
-                  <span>{c.name}</span>
+                <li key={c.name} className="flex items-center gap-2">
+                  <span className="grow break-all">{c.name}</span>
                   <span className="text-slate-400">1:{c.scale.toLocaleString()}</span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${c.name}`}
+                    onClick={() => removeUpload(c.name)}
+                    className="rounded px-1 text-slate-400 hover:text-red-400"
+                  >
+                    ×
+                  </button>
                 </li>
               ))}
             </ul>
           )}
 
-          <p className="text-xs text-slate-400">Not for navigation.</p>
+          <p className="text-xs text-slate-400">Beyond the charts: seabed, GEBCO_2026 Grid; coast, © OpenStreetMap contributors. Not for navigation.</p>
         </aside>
       </div>
       <SearchBar go={goTo} />
@@ -1312,6 +1362,14 @@ export default function App() {
           <use href="#world" x="360" />
           <polygon ref={footprint} fill="#67e8f9" fillOpacity="0.25" stroke="#67e8f9" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />
         </svg>
+      </div>
+      <div
+        role="status"
+        className={`pointer-events-none absolute inset-0 z-20 grid place-items-center bg-slate-900/50 transition-opacity duration-150 ${
+          grey ? 'opacity-100' : 'opacity-0'
+        }`}
+      >
+        {grey && <p className="text-xl font-semibold text-slate-100">Loading Items</p>}
       </div>
     </div>
   )

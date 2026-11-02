@@ -19,15 +19,24 @@ import mapbox_earcut
 import numpy as np
 import pandas as pd
 import pyogrio
+import rasterio
 import shapely
 from numpy.lib.stride_tricks import sliding_window_view
+from rasterio.windows import Window
 
 FORMAT = 4  # raise it when these files change: browsers and backend/cache keep them for good
-LAND_FORMAT = 1  # the same, for the world's land
+LAND_FORMAT = 3  # the same, for the world's land
+SEA_FORMAT = 3  # the same, for the world's seabed
+WIDE = 3  # degrees: a chart wider or taller than this isn't offsets from its middle, as they bend, and neighbours part
+SEA_GRID = 150  # squares across a tile of it
+SEA_CELLS = 240  # to the degree, in GEBCO's grid
+SEA_PART = 90 * SEA_CELLS  # cells on a side of each of its files
 TOLERANCE = 0.2e-3 / 111_000  # degrees per unit of chart scale: 0.2 mm on the chart, finer than it can show
 LAND_HEIGHT = 15  # m: LNDARE carries no heights
 LAND_RGB = np.array([47, 53, 64])
 COAST_RGB = np.array([140, 199, 242])
+SPLIT_BATCH = 50_000  # polygons at a time: all of OpenStreetMap's land at once would fill this machine's memory
+COAST_FILE = 10  # degrees, on a side
 WORLD_SIMPLIFY = 0.03  # degrees: about 3 km, under a pixel at the zooms that show the whole world as one piece
 SHALLOW_RGB = np.array([126, 214, 223])
 DEEP_RGB = np.array([8, 30, 66])
@@ -359,7 +368,7 @@ def wall_mesh(wall: tuple, rgb: np.ndarray | None = None) -> tuple:
 
 def pack(name: str, scale: int, bounds: list, meshes: dict, centred: bool = True) -> bytes:
     west, south, east, north = bounds or [0, 0, 0, 0]
-    # offsets from the middle keep small things precise; the whole world is too big for them, and has an origin of 0
+    # offsets from the middle keep small things precise; anything big bends if it's drawn that way, and has an origin of 0
     origin = [round((west + east) / 2, 3), round((south + north) / 2, 3)] if centred else None
     head = {"name": name, "scale": scale, "bounds": bounds, "origin": origin, "meshes": {}}
     body = []
@@ -403,7 +412,7 @@ def compile_cell(path: Path, hole: shapely.Geometry | None = None) -> bytes:
     *wall, owner = walls(polys, height)
     for key, these, rgb in (("waterWalls", ~is_land[owner], None), ("landWalls", is_land[owner], LAND_RGB)):
         meshes[key] = wall_mesh([part[these] for part in wall], rgb) if these.any() else empty
-    return pack(name, scale, bounds, meshes)
+    return pack(name, scale, bounds, meshes, centred=max(bounds[2] - bounds[0], bounds[3] - bounds[1]) <= WIDE)
 
 
 def save(data: bytes, out: Path) -> None:
@@ -474,17 +483,63 @@ def line_mesh(a: np.ndarray, b: np.ndarray) -> tuple:
     return ends, np.tile(COAST_RGB, (len(ends), 1)), np.arange(len(ends))
 
 
-def compile_land(land: Path, lakes: Path, bounds: tuple, hole_wkb: bytes | None, out: Path) -> None:
-    """The world's land in one tile: a slab with its coast outlined, less any lakes and where charts cover it.
+def split_land(source: Path, folder: Path) -> None:
+    """OpenStreetMap's land, in a file for each 10 degree square: read straight from its one file, an area takes half
+    a minute. The pieces are at most a degree across, so few land in more than one."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for start in range(0, pyogrio.read_info(source)["features"], SPLIT_BATCH):
+        polys = pyogrio.read_dataframe(source, columns=[], skip_features=start, max_features=SPLIT_BATCH).geometry.to_numpy()
+        files = {}
+        for blob, (west, south, east, north) in zip(shapely.to_wkb(polys), shapely.bounds(polys)):
+            for x in range(int(west // COAST_FILE), int(east // COAST_FILE) + 1):
+                for y in range(int(south // COAST_FILE), int(north // COAST_FILE) + 1):
+                    files.setdefault((x, y), []).append(struct.pack("<I", len(blob)) + blob)
+        for (x, y), blobs in files.items():
+            with open(folder / f"{x * COAST_FILE}_{y * COAST_FILE}.wkb", "ab") as file:
+                file.write(b"".join(blobs))
+
+
+def coast_in(folder: Path, bounds: tuple, tolerance: float) -> np.ndarray:
+    """OpenStreetMap's land in an area, as one so that its pieces' seams don't show, simplified to suit."""
+    west, south, east, north = bounds
+    blobs = []
+    for x in range(int(west // COAST_FILE), int(np.ceil(east / COAST_FILE))):
+        for y in range(int(south // COAST_FILE), int(np.ceil(north / COAST_FILE))):
+            path = folder / f"{x * COAST_FILE}_{y * COAST_FILE}.wkb"
+            data = path.read_bytes() if path.exists() else b""
+            at = 0
+            while at < len(data):
+                size = struct.unpack_from("<I", data, at)[0]
+                blobs.append(data[at + 4 : at + 4 + size])
+                at += 4 + size
+    if not blobs:
+        return np.empty(0, dtype=object)
+    polys = shapely.from_wkb(blobs)
+    polys = polys[shapely.STRtree(polys).query(shapely.box(*bounds), "intersects")]
+    if not len(polys):
+        return polys
+    # simplified first, as joining them whole takes minutes, and without keeping every islet, which takes as long;
+    # the grid closes the hairlines this leaves at their seams
+    rough = only_polygons(shapely.make_valid(shapely.simplify(polys, tolerance, preserve_topology=False)))
+    joined = shapely.get_parts(shapely.union_all(rough[shapely.area(rough) > tolerance**2], grid_size=tolerance))
+    return only_polygons(shapely.make_valid(shapely.clip_by_rect(joined, *bounds)))
+
+
+def compile_land(land: Path, lakes: Path, bounds: tuple, hole_wkb: bytes | None, out: Path, tolerance: float = 0) -> None:
+    """The world's land in one tile: a slab with its coast outlined, less any lakes and where charts cover it. land is
+    a file of polygons, or a folder of OpenStreetMap's from split_land.
 
     "coast" is the whole outline, for when the map is too far out for the charts' own coast to show it; "outline"
-    leaves out what the charts cover, where Natural Earth's coast wouldn't match the charts'."""
-    polys, tree = load_polygons(land)
+    leaves out what the charts cover, where the world's coast wouldn't match the charts'."""
     lake_polys, lake_tree = load_polygons(lakes)
     west, south, east, north = bounds
     area = shapely.box(*bounds)
     empty = (np.empty((0, 3)), np.empty((0, 3)), np.empty(0))
-    whole = only_polygons(shapely.make_valid(shapely.clip_by_rect(polys[tree.query(area, "intersects")], *bounds)))
+    if land.is_dir():
+        whole = coast_in(land, bounds, tolerance)
+    else:
+        polys, tree = load_polygons(land)
+        whole = only_polygons(shapely.make_valid(shapely.clip_by_rect(polys[tree.query(area, "intersects")], *bounds)))
     in_lakes = lake_polys[lake_tree.query(area, "intersects")]
     if len(in_lakes) and len(whole):
         whole = only_polygons(shapely.make_valid(shapely.difference(whole, shapely.union_all(in_lakes))))
@@ -518,4 +573,41 @@ def compile_land(land: Path, lakes: Path, bounds: tuple, hole_wkb: bytes | None,
             a2, b2 = segments(left)
             kept = np.isin(point_keys(a2), coast) & np.isin(point_keys(b2), coast)
             meshes["outline"] = line_mesh(a2[kept], b2[kept])
-    save(pack(out.stem, 0, list(bounds), meshes, centred=not world), out)
+    save(pack(out.stem, 0, list(bounds), meshes, centred=False), out)
+
+
+def gebco_heights(folder: Path, columns: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """GEBCO's heights at these cells of its world grid, counted from its north-west corner. It comes in eight files."""
+    out = np.empty((len(rows), len(columns)), dtype=np.int16)
+    for across in np.unique(columns // SEA_PART):
+        for down in np.unique(rows // SEA_PART):
+            these_columns, these_rows = columns // SEA_PART == across, rows // SEA_PART == down
+            x, y = columns[these_columns] % SEA_PART, rows[these_rows] % SEA_PART
+            west, north = -180 + 90 * across, 90 - 90 * down
+            name = f"gebco_2026_n{north:.1f}_s{north - 90:.1f}_w{west:.1f}_e{west + 90:.1f}_geotiff.tif"
+            window = Window(x.min(), y.min(), np.ptp(x) + 1, np.ptp(y) + 1)
+            with rasterio.open(folder / name) as source:
+                block = source.read(1, window=window)
+            out[np.ix_(these_rows, these_columns)] = block[np.ix_(y - y.min(), x - x.min())]
+    return out
+
+
+def compile_sea(folder: Path, bounds: tuple, out: Path) -> None:
+    """A tile of the world's seabed. Its corners are cells of GEBCO's grid shared with the tiles around it, so they meet
+    exactly. Land stays in, at the waterline: it lies under the world's land, and shows as shallows where a finer coast
+    than GEBCO's opens water there, as in docks."""
+    west, south, east, north = bounds
+    step = round((east - west) * SEA_CELLS / SEA_GRID)
+    steps = step * np.arange(SEA_GRID + 1)
+    columns = (round((west + 180) * SEA_CELLS) + steps) % (360 * SEA_CELLS)
+    rows = np.minimum(round((90 - north) * SEA_CELLS) + steps, 180 * SEA_CELLS - 1)
+    heights = gebco_heights(folder, columns, rows).astype(float).ravel()
+    corners = np.arange((SEA_GRID + 1) ** 2).reshape(SEA_GRID + 1, SEA_GRID + 1)
+    a, b, c, d = corners[:-1, :-1], corners[:-1, 1:], corners[1:, :-1], corners[1:, 1:]
+    triangles = np.stack([a, c, b, b, c, d], axis=-1).reshape(-1, 3)
+    used, triangles = np.unique(triangles, return_inverse=True)
+    lon, lat = np.meshgrid(np.linspace(west, east, SEA_GRID + 1), np.linspace(north, south, SEA_GRID + 1))
+    positions = np.column_stack([lon.ravel()[used], lat.ravel()[used], np.minimum(heights[used], 0)])
+    mesh = positions, colour(-positions[:, 2]), triangles.ravel()
+    # (only the finest level needs offsets, for the zooms it shows at)
+    save(pack(out.stem, 0, list(bounds), {"waterBase": mesh}, centred=east - west < 1), out)

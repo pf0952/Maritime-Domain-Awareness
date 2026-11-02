@@ -18,7 +18,7 @@ cell = alaska.read_bytes()
 
 
 def upload(name: str, data: bytes):
-    return client.post("/api/compile", files={"file": (name, data)})
+    return client.post("/api/uploads", files={"file": (name, data)})
 
 
 def unpack(data: bytes) -> dict:
@@ -36,9 +36,7 @@ def unpack(data: bytes) -> dict:
     return chart
 
 
-res = upload("US3AK1EX.000", cell)
-assert res.status_code == 200, res.text
-chart = unpack(res.content)
+chart = unpack(charts.compile_cell(alaska))
 assert (chart["name"], chart["scale"]) == ("US3AK1EX", 180000)
 west, south, east, north = chart["bounds"]
 assert -180 <= west < east <= 180 and -90 <= south < north <= 90

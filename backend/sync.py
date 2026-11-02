@@ -29,12 +29,24 @@ CACHE = Path(__file__).parent / "cache"
 LAND = Path(__file__).parent.parent / "enc" / "land"
 LAND_URL = "https://naciscdn.org/naturalearth/"
 LAND_FILES = {
-    "detail": "10m/physical/ne_10m_land",
     "overview": "50m/physical/ne_50m_land",
     "lakes": "10m/physical/ne_10m_lakes",
 }
-LAND_TILE = 10  # degrees, on a side
-WORLD_ZOOM = 7  # below this the whole world shows as one piece; from here, tiles of finer land
+WORLD_ZOOM = 7  # below this the whole world shows as one piece; from here, tiles of OpenStreetMap's coast
+COAST = LAND / "coast"
+COAST_URL = "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip"
+COAST_SIZES = (10, 2.5, 0.625)  # degrees on a side of a tile of it, at each level of detail
+COAST_ZOOMS = (8.5, 10.5)  # the zoom each finer level comes in at
+COAST_SIMPLIFY = (0.003, 0.0006, 0.00012)  # degrees: under a pixel at each level, or islands turn angular
+SEA = ENC.parent / "gebco"
+SEA_URL = "https://dap.ceda.ac.uk/bodc/gebco/global/gebco_2026/ice_surface_elevation/geotiff/gebco_2026_geotiff.zip"
+SEA_FILES = 8
+SEA_SIZES = (30, 10, 2.5, 0.625)  # degrees on a side of a tile of the world's seabed, at each level of detail
+SEA_ZOOMS = (5.5, 7.5, 9.5)  # the zoom each finer level comes in at
+SEA_TILES = 16  # at most in a view, or it takes a coarser level
+SEA_CHUNK = 1024 * 1024
+UPLOADS = ENC.parent / "uploads"
+BAND_SCALES = (1_500_000, 600_000, 150_000, 30_000, 8_000)  # coarser than these: bands 1 to 5, for cells not named by band
 CATALOG_URL = "https://www.charts.noaa.gov/ENCs/ENCProdCat.xml"
 CHECK_EVERY = 6 * 3600  # s
 RETRY_AFTER = 300  # s, when the last check went wrong
@@ -60,7 +72,9 @@ class Chart:
 
     @property
     def band(self) -> int:  # 1 overview ... 6 berthing
-        return int(self.name[2])
+        if self.name[2:3].isdigit():
+            return int(self.name[2])
+        return 1 + sum(self.scale < coarser for coarser in BAND_SCALES)
 
     @property
     def rank(self) -> tuple:  # finest first
@@ -97,6 +111,7 @@ class Catalog:
 
 
 catalog = Catalog([])
+noaa = []  # the catalog's charts before any uploads take over
 on_disk = {}  # name: version
 status = {"phase": "starting", "done": 0, "total": 0, "checked": None, "problem": None, "revision": 0, "ready": False}
 
@@ -159,12 +174,50 @@ def fetch_catalog() -> bytes | None:
 
 def adopt(xml: bytes) -> None:
     """Takes on a catalog, and finds out which of its cells are in enc/."""
-    global catalog
-    catalog = read_catalog(xml)
+    global noaa
+    noaa = read_catalog(xml).charts
     with ThreadPoolExecutor(DOWNLOADS) as pool:
-        found = pool.map(local_version, (c.name for c in catalog.charts))
-        on_disk.update({c.name: v for c, v in zip(catalog.charts, found) if v})
+        found = pool.map(local_version, (c.name for c in noaa))
+        on_disk.update({c.name: v for c, v in zip(noaa, found) if v})
+    take_uploads()
+
+
+def uploaded_chart(path: Path) -> Chart:
+    """A cell of the user's own as a chart. Its contents decide its version, as nobody issues it one."""
+    data = path.read_bytes()
+    name, scale, cell = charts.read_areas(path)
+    covered = charts.polygons(path, "M_COVR", ("CATCOV",))
+    covered = covered[covered["CATCOV"] == 1].geometry.to_numpy()
+    cover = shapely.union_all(shapely.make_valid(covered)) if len(covered) else shapely.box(*cell.total_bounds)
+    cover = onto_the_map(cover)
+    return Chart(name, scale, hashlib.sha1(data).hexdigest()[:12], None, cover, hashlib.sha1(cover.wkb).hexdigest()[:12])
+
+
+def take_uploads() -> None:
+    """Puts the user's charts in with NOAA's. They go through all the same machinery, and win if they share a name."""
+    global catalog
+    mine = [uploaded_chart(path) for path in sorted(UPLOADS.glob("*.000"))]
+    on_disk.update({c.name: c.version for c in mine})
+    names = {c.name for c in mine}
+    catalog = Catalog([c for c in noaa if c.name not in names] + mine)
     status["revision"] += 1
+
+
+def add_upload(cell: Path) -> Chart:
+    """Keeps a cell the user has sent. An unreadable one raises what charts.read_areas does, and isn't kept."""
+    chart = uploaded_chart(cell)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(cell, UPLOADS / f"{chart.name}.000")
+    take_uploads()
+    return catalog.by_name[chart.name]
+
+
+def remove_upload(name: str) -> None:
+    (UPLOADS / f"{name}.000").unlink(missing_ok=True)
+    on_disk.pop(name, None)
+    if version := local_version(name):  # NOAA's chart of that name comes back
+        on_disk[name] = version
+    take_uploads()
 
 
 def local_version(name: str) -> tuple | None:
@@ -232,13 +285,15 @@ def charted(area: shapely.Geometry, cat: Catalog) -> bool:
 
 
 def cell_path(chart: Chart) -> Path:
-    return ENC / chart.name / f"{chart.name}.000"
+    return ENC / chart.name / f"{chart.name}.000" if chart.url else UPLOADS / f"{chart.name}.000"
 
 
 def chart_file(chart: Chart, tier: int, catalog: Catalog) -> Path:
     """Named for the chart's version and the outlines cut from it, so a change to either is a new file and a new URL."""
     finer = "".join(c.cover_id for c in catalog.finer(chart, tier))
-    key = hashlib.sha1(f"{charts.FORMAT}{on_disk.get(chart.name)}{finer}".encode()).hexdigest()[:12]
+    west, south, east, north = chart.cover.bounds
+    wide = "wide" if max(east - west, north - south) > charts.WIDE else ""
+    key = hashlib.sha1(f"{charts.FORMAT}{wide}{on_disk.get(chart.name)}{finer}".encode()).hexdigest()[:12]
     return CACHE / f"{chart.name}-{key}.gz"
 
 
@@ -273,18 +328,13 @@ def fetch_land() -> None:
             land_source(key).with_suffix(".part").replace(land_source(key))
 
 
-def land_tiles() -> dict:
-    """The world's tiles of land: name: bounds. "WORLD" is the lot, coarsely."""
-    tiles = {"WORLD": (-180.0, -85.0, 180.0, 85.0)}
-    for west in range(-180, 180, LAND_TILE):
-        for south in range(-90, 90, LAND_TILE):
-            tiles[f"LAND_{west}_{south}"] = tuple(map(float, (west, south, west + LAND_TILE, south + LAND_TILE)))
-    return tiles
+def land_bounds(name: str) -> tuple:
+    return (-180.0, -85.0, 180.0, 85.0) if name == "WORLD" else tile_bounds(name, COAST_SIZES)
 
 
 def land_cut(name: str, tier: int, cat: Catalog) -> list:
     """The charts that show over a tile of land at a tier. Their land takes over from it."""
-    return [c for c in cat.over(shapely.box(*land_tiles()[name])) if c.band <= tier]
+    return [c for c in cat.over(shapely.box(*land_bounds(name))) if c.band <= tier]
 
 
 def land_file(name: str, tier: int, cat: Catalog) -> Path:
@@ -298,33 +348,108 @@ def land_job(name: str, tier: int, file: Path, cat: Catalog) -> tuple:
     """A function and what to call it with, to compile a tile of land."""
     covering = land_cut(name, tier, cat)
     hole = shapely.union_all([c.cover for c in covering]).wkb if covering else None
-    source = land_source("overview" if name == "WORLD" else "detail")
-    return charts.compile_land, source, land_source("lakes"), land_tiles()[name], hole, file
+    lakes = land_source("lakes")
+    if name == "WORLD":
+        return charts.compile_land, land_source("overview"), lakes, land_bounds(name), hole, file
+    return charts.compile_land, COAST, lakes, land_bounds(name), hole, file, COAST_SIMPLIFY[int(name.split("_")[1])]
 
 
 def land_view(area: shapely.Geometry, zoom: float, cat: Catalog) -> list:
     """The pieces of world land to show in an area."""
-    if not land_source("detail").exists():
+    if not land_source("overview").exists():
         return []
-    if zoom < WORLD_ZOOM:
+    if zoom < WORLD_ZOOM or not COAST.exists():
         return ["WORLD"]
-    parts = [part.bounds for part in shapely.get_parts(area)]  # either side of the date line
-    return [
-        name for name, bounds in land_tiles().items()
-        if name != "WORLD"
-        and any(bounds[0] < e and bounds[2] > w and bounds[1] < n and bounds[3] > s for w, s, e, n in parts)
-    ]
+    return tiles_in(area, zoom, "COAST", COAST_SIZES, COAST_ZOOMS)
+
+
+def fetch_big(url: str, path: Path) -> None:
+    """A big file: a broken download carries on where it stopped."""
+    part = path.with_suffix(".zip.part")
+    done = part.stat().st_size if part.exists() else 0
+    request = urllib.request.Request(url, headers={"Range": f"bytes={done}-"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as res, open(part, "ab" if res.status == 206 else "wb") as file:
+        shutil.copyfileobj(res, file, SEA_CHUNK)
+    part.replace(path)
+
+
+def fetch_coast() -> None:
+    """OpenStreetMap's land, split up for reading by area. Coasts hardly move, so once is enough."""
+    packed = LAND / "land-polygons-split-4326.zip"
+    if not packed.exists():
+        fetch_big(COAST_URL, packed)
+    work = LAND / "coast.part"
+    shutil.rmtree(work, ignore_errors=True)
+    with zipfile.ZipFile(packed) as z:
+        z.extractall(work / "source")
+    charts.split_land(next((work / "source").rglob("*.shp")), work / "tiles")
+    (work / "tiles").replace(COAST)
+    shutil.rmtree(work)
+    packed.unlink()
+
+
+def have_sea() -> bool:
+    return len(list(SEA.glob("*.tif"))) == SEA_FILES
+
+
+def fetch_sea() -> None:
+    """GEBCO's world grid, once a year at most: it's 4 GB, so a broken download carries on where it stopped."""
+    SEA.mkdir(parents=True, exist_ok=True)
+    packed = SEA / "gebco.zip"
+    if not packed.exists():
+        fetch_big(SEA_URL, packed)
+    with zipfile.ZipFile(packed) as z:
+        z.extractall(SEA, [name for name in z.namelist() if name.endswith(".tif") and "/" not in name])
+    packed.unlink()
+
+
+def tile_bounds(name: str, sizes: tuple) -> tuple:
+    level, x, y = map(int, name.split("_")[1:])
+    size = sizes[level]
+    return -180 + x * size, -90 + y * size, -180 + (x + 1) * size, -90 + (y + 1) * size
+
+
+def sea_bounds(name: str) -> tuple:
+    return tile_bounds(name, SEA_SIZES)
+
+
+def tiles_in(area: shapely.Geometry, zoom: float, kind: str, sizes: tuple, zooms: tuple, covered=None) -> list:
+    """A tiled layer's tiles in an area: as fine as the zoom wants, if that's not too many of them. Tiles wholly under
+    covered, the charts showing, are left out."""
+    level = sum(zoom >= z for z in zooms)
+    while True:
+        size = sizes[level]
+        names = {
+            f"{kind}_{level}_{x}_{y}"
+            for west, south, east, north in (part.bounds for part in shapely.get_parts(area))
+            for x in range(int((west + 180) // size), int(np.ceil((east + 180) / size)))
+            for y in range(int((south + 90) // size), int(np.ceil((north + 90) / size)))
+        }
+        if covered is not None:
+            shapely.prepare(covered)
+            names = {name for name in names if not covered.contains(shapely.box(*tile_bounds(name, sizes)))}
+        if len(names) <= SEA_TILES or level == 0:
+            return sorted(names)
+        level -= 1
+
+
+def sea_view(area: shapely.Geometry, zoom: float, covered: shapely.Geometry | None = None) -> list:
+    """The tiles of the world's seabed to show in an area."""
+    return tiles_in(area, zoom, "SEA", SEA_SIZES, SEA_ZOOMS, covered) if have_sea() else []
+
+
+def sea_file(name: str) -> Path:
+    return CACHE / f"{name}-{charts.SEA_FORMAT}.gz"
 
 
 def compile_all() -> None:
     files = all_files(catalog)
     todo = [(file, *job) for file, job in files.items() if not file.exists()]
     land = {}
-    if land_source("detail").exists():
-        # the whole world is only seen from far out: with the coarsest charts, or none
-        for name in land_tiles():
-            for tier in (0, LOWEST_TIER) if name == "WORLD" else range(LOWEST_TIER, 7):
-                land.setdefault(land_file(name, tier, catalog), (name, tier))
+    if land_source("overview").exists():
+        # the whole world is only seen from far out: with the coarsest charts, or none. The coast's tiles wait to be seen.
+        for tier in (0, LOWEST_TIER):
+            land.setdefault(land_file("WORLD", tier, catalog), ("WORLD", tier))
     todo_land = [(file, *job) for file, job in land.items() if not file.exists()]
     status.update(phase="compiling", done=0, total=len(todo) + len(todo_land))
     jobs = [(charts.compile_file, cell_path(c), cut_out(c, tier, catalog), file) for file, c, tier in todo]
@@ -361,16 +486,21 @@ def compile_all() -> None:
         status["problem"] = f"{failed} of {status['total']} charts didn't compile: {error!r}"
     if catalog.charts:  # (with no catalog to go by, everything would look old)
         for old in CACHE.glob("*.gz"):  # older versions of charts
-            if old not in files and old not in land:
+            name = old.stem.rsplit("-", 1)[0]
+            coast = name.startswith("COAST_") and any(old == land_file(name, t, catalog) for t in range(LOWEST_TIER, 7))
+            if old not in files and old not in land and old != sea_file(name) and not coast:
                 old.unlink(missing_ok=True)
 
 
 def check() -> None:
     status.update(phase="checking", problem=None)
     saved = ENC.parent / "ENCProdCat.xml"
-    if not catalog.charts and saved.exists():  # open with what we have: NOAA can take its time, or be away
-        adopt(saved.read_bytes())
-        status["ready"] = sum(not file.exists() for file in all_files(catalog)) <= BACKLOG
+    if not catalog.charts:  # open with what we have: NOAA can take its time, or be away
+        if saved.exists():
+            adopt(saved.read_bytes())
+            status["ready"] = sum(not file.exists() for file in all_files(catalog)) <= BACKLOG
+        else:
+            take_uploads()
     xml = fetch_catalog()
     if xml:
         adopt(xml)
@@ -385,7 +515,20 @@ def check() -> None:
     except (OSError, HTTPException) as e:
         status["problem"] = f"Couldn't get the world's land: {e}"
     compile_all()
-    status.update(phase="idle", ready=True, checked=time.time())
+    status.update(ready=True)
+    if not COAST.exists():  # (the map has the world's coarse land till then, so it doesn't hold anything up)
+        status.update(phase="coast", done=0, total=0)
+        try:
+            fetch_coast()
+        except (OSError, HTTPException, zipfile.BadZipFile) as e:
+            status["problem"] = f"Couldn't get the world's coast: {e}"
+    if not have_sea():  # (the map works without it, so it doesn't hold anything up)
+        status.update(phase="seabed", done=0, total=0)
+        try:
+            fetch_sea()
+        except (OSError, HTTPException, zipfile.BadZipFile) as e:
+            status["problem"] = f"Couldn't get the world's seabed: {e}"
+    status.update(phase="idle", checked=time.time())
 
 
 def run() -> None:

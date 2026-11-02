@@ -46,8 +46,17 @@ app = FastAPI(title="ENC 3D", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
-@app.post("/api/compile")
-def compile_upload(file: UploadFile):
+def upload_summary(chart: sync.Chart) -> dict:
+    return {"name": chart.name, "scale": chart.scale, "bounds": chart.cover.bounds}
+
+
+@app.get("/api/uploads")
+def get_uploads():
+    return [upload_summary(c) for c in sync.catalog.charts if c.url is None]
+
+
+@app.post("/api/uploads")
+def add_upload(file: UploadFile):
     name = Path(file.filename or "").name
     if not name.lower().endswith(".000"):
         raise HTTPException(415, f"{name or 'That file'} isn't an S-57 .000 cell")
@@ -58,9 +67,18 @@ def compile_upload(file: UploadFile):
         path = Path(tmp) / "cell.000"
         path.write_bytes(data)
         try:
-            return Response(charts.compile_cell(path), media_type="application/octet-stream")
+            return upload_summary(sync.add_upload(path))
         except UNREADABLE:
             raise HTTPException(422, f"{name} isn't a readable S-57 cell")
+
+
+@app.delete("/api/uploads/{name}")
+def delete_upload(name: str):
+    chart = sync.catalog.by_name.get(name)
+    if chart is None or chart.url is not None:
+        raise HTTPException(404, f"No uploaded chart {name}")
+    sync.remove_upload(name)
+    return {"name": name}
 
 
 @app.get("/api/warnings")
@@ -76,7 +94,7 @@ def get_status():
 @app.get("/api/view")
 def get_view(west: float, south: float, east: float, north: float, tier: int, corners: str, zoom: float = 6):
     """What to show in that area: the world's land, then charts, coarsest first; whether any ENC is in sight; and
-    the bounds of those detailed enough to stand buildings on, as coarser ones draw the coast too roughly for them.
+    the bounds of where to stand buildings, as coarse charts draw the coast too roughly for them.
 
     corners are the four corners of the screen on the map, lng,lat,...: a tilted view is no rectangle, and the area
     around it reaches well past what's on screen."""
@@ -86,8 +104,15 @@ def get_view(west: float, south: float, east: float, north: float, tier: int, co
     in_sight = sync.on_the_map(shapely.make_valid(screen))
     land = [(name, tier, sync.land_file(name, tier, catalog)) for name in sync.land_view(area, zoom, catalog)]
     picked = [(c.name, tier, sync.chart_file(c, tier, catalog)) for c in reversed(catalog.pick(area, tier))]
-    pieces = [{"name": name, "tier": t, "key": file.stem} for name, t, file in land + picked]
-    detailed = [c.cover.bounds for c in catalog.over(in_sight) if c.band >= sync.COASTAL_BAND]
+    covered = shapely.union_all([c.cover for c in catalog.pick(area, tier)])
+    # last, as charts hide it and hidden costs less, and none at all of what they hide completely
+    sea = [(name, 0, sync.sea_file(name)) for name in sync.sea_view(area, zoom, covered)]
+    pieces = [{"name": name, "tier": t, "key": file.stem} for name, t, file in land + picked + sea]
+    charts_here = catalog.over(in_sight)
+    detailed = [c.cover.bounds for c in charts_here if c.band >= sync.COASTAL_BAND]
+    # beyond the charts OpenStreetMap draws both the coast and the buildings, so they agree
+    uncharted = in_sight.difference(shapely.union_all([c.cover for c in charts_here]))
+    detailed += [part.bounds for part in shapely.get_parts(uncharted) if not part.is_empty]
     return {"charted": sync.charted(in_sight, catalog), "detailed": detailed, "pieces": pieces}
 
 
@@ -139,11 +164,24 @@ def get_outline():
 @app.get("/api/chart/{name}/{tier}")
 def get_chart(name: str, tier: int):
     catalog = sync.catalog
-    if name in sync.land_tiles():
-        path = sync.land_file(name, tier, catalog)
+    if name.startswith("SEA_"):
+        path = sync.sea_file(name)
         if not path.exists():
-            function, *args = sync.land_job(name, tier, path, catalog)
-            function(*args)
+            try:
+                charts.compile_sea(sync.SEA, sync.sea_bounds(name), path)
+            except (ValueError, IndexError):
+                raise HTTPException(404, f"No tile {name}")
+            except OSError:
+                raise HTTPException(503, "The world's seabed can't be read just now")
+        return chart_response(path)
+    if name == "WORLD" or name.startswith("COAST_"):
+        try:
+            path = sync.land_file(name, tier, catalog)
+            if not path.exists():
+                function, *args = sync.land_job(name, tier, path, catalog)
+                function(*args)
+        except (ValueError, IndexError):
+            raise HTTPException(404, f"No tile {name}")
         return chart_response(path)
     chart = catalog.by_name.get(name)
     if chart is None or name not in sync.on_disk:
