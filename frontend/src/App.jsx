@@ -9,6 +9,7 @@ import { EMPTY, SOFTWARE, daylightAt, fromOutline, onOutline, overlaps, sunAt, t
 import { AIDS, AIS, PLEASURE, VESSEL_CATEGORIES, VESSEL_DOT, VESSEL_FOUND_ZOOM, VESSEL_REFRESH, vesselAt, vesselCategory, vesselLengthAt, vesselShape, vesselTiles } from './vessels'
 import { ROMAN, WARNING_AGES, WARNING_CATEGORIES, WARNING_DOT, WARNING_DOT_PICKED, WARNING_EDGE, WARNING_FILL, WARNING_FILL_PICKED, cutFeeds, warningShapes, warningsAt } from './warnings'
 import { Charts, unpack } from './meshes'
+import { ICONS, Section, SideMenu, Toggle } from './menu'
 import { LoadingScreen, SearchBar, TIDE_HOURS, TidePanel, VesselCard, syncMessage } from './panels'
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
@@ -132,7 +133,6 @@ export default function App() {
     vessels: true,
   })
   const [contourDepths, setContourDepths] = useState({ shallow: '2', safety: '10', deep: '30' })
-  const [menuOpen, setMenuOpen] = useState(true)
   const [outline, setOutline] = useState('')
   const [charted, setCharted] = useState(true) // is any ENC in view?
   const [detailed, setDetailed] = useState(true) // is any in view fine enough to stand buildings on?
@@ -701,203 +701,37 @@ export default function App() {
 
   const enc = shown.filter((piece) => !/^(WORLD|COAST_|SEA_)/.test(piece.id))
 
-  return (
-    <div className="fixed inset-0 bg-slate-950">
-      <div ref={mapBox} className="h-full" />
-      <div
-        className={`absolute top-4 left-4 max-h-[calc(100%-2rem)] transition-transform duration-200 ${
-          menuOpen ? '' : '-translate-x-[calc(100%+1rem)]'
-        }`}
-      >
-        <button
-          type="button"
-          aria-expanded={menuOpen}
-          aria-label={menuOpen ? 'Hide the menu' : 'Show the menu'}
-          onClick={() => setMenuOpen(!menuOpen)}
-          className="absolute top-3 left-full z-10 ml-px rounded-r-lg border border-l-0 border-slate-700 bg-slate-900/90 px-1.5 py-3 text-slate-200 hover:text-cyan-300"
-        >
-          {menuOpen ? '‹' : '›'}
-        </button>
-        <aside
-          inert={!menuOpen}
-          className="flex max-h-[calc(100vh-2rem)] w-72 flex-col gap-4 overflow-y-auto rounded-xl [scrollbar-color:#475569_transparent] [scrollbar-width:thin] border border-slate-700 bg-slate-900/90 p-4 text-sm text-slate-100 shadow-xl"
-        >
-          <h1 className="text-base font-semibold">ENC 3D</h1>
-
+  const shows = (key) => (on) => setShow({ ...show, [key]: on })
+  const note = 'text-xs text-slate-400'
+  const link = 'underline hover:text-cyan-300'
+  // each later phase adds a menu here, or a section to one: 3D models to Chart and Vessels, weather and currents to
+  // Conditions, range and bearing as Tools
+  const menus = [
+    {
+      id: 'chart',
+      label: 'Chart',
+      title: 'Chart',
+      icon: ICONS.chart,
+      alert: !!(sync?.problem || error),
+      body: (
+        <>
           <div role="status" className="flex flex-col gap-1">
             <p className="text-slate-300">{syncMessage(sync)}</p>
             {sync?.problem && <p className="text-amber-300">{sync.problem}</p>}
             <p className="flex items-center gap-2 text-slate-400">
-              {loading && (
-                <span className="size-3 shrink-0 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
-              )}
+              {loading && <span className="size-3 shrink-0 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />}
               {loading ? 'Loading charts in view' : `${enc.length} ${enc.length === 1 ? 'ENC' : 'ENCs'} in view`}
             </p>
           </div>
 
-          <label
-            className={`relative block rounded-lg border border-dashed border-slate-500 p-4 text-center focus-within:ring-2 focus-within:ring-cyan-400 ${
-              compiling ? 'opacity-60' : 'hover:border-cyan-400'
-            }`}
-          >
-            <span>Add your own: drop .000 cells here, or click to choose</span>
-            <input
-              type="file"
-              accept=".000"
-              multiple
-              disabled={!!compiling}
-              className="absolute inset-0 cursor-pointer opacity-0 disabled:cursor-wait"
-              onChange={(e) => {
-                upload([...e.target.files])
-                e.target.value = ''
-              }}
-            />
-          </label>
+          <Section title="Layers">
+            <Toggle checked={show.depare} onChange={shows('depare')}>Depth areas</Toggle>
+            <Toggle checked={show.lndare} onChange={shows('lndare')}>Land</Toggle>
+            <Toggle checked={show.buildings} onChange={shows('buildings')}>Buildings</Toggle>
+          </Section>
 
-          <div role="status" className="empty:hidden">
-            {compiling && (
-              <p className="flex items-center gap-2 break-all text-cyan-300">
-                <span className="size-4 shrink-0 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" />
-                Compiling {compiling}
-              </p>
-            )}
-            {error && <p className="text-red-400">{error}</p>}
-          </div>
-
-          <fieldset className="flex flex-col gap-1">
-            <legend className="mb-1 font-medium text-slate-400">Layers</legend>
-            {[
-              ['depare', 'Depth areas'],
-              ['lndare', 'Land'],
-              ['buildings', 'Buildings'],
-              ['tide', 'Tide bar'],
-              ['daylight', 'Day and night'],
-              ['warnings', 'Nav warnings'],
-              ['vessels', 'Vessels (AIS)'],
-            ].map(([key, label]) => (
-              <label key={key} className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  className="accent-cyan-400"
-                  checked={show[key]}
-                  onChange={(e) => setShow({ ...show, [key]: e.target.checked })}
-                />
-                {label}
-              </label>
-            ))}
-          </fieldset>
-
-          {show.vessels && (
-            <fieldset className="flex flex-col gap-1">
-              <legend className="mb-1 font-medium text-slate-400">Vessel filters</legend>
-              <p role="status" className="text-slate-300">
-                {vesselsFailed ? 'No AIS data just now' : `${filteredVessels.length} of ${vessels.length} in view`}
-              </p>
-              {Object.entries(VESSEL_CATEGORIES).map(([name, rgb]) => (
-                <label key={name} className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    className="accent-cyan-400"
-                    checked={vesselCategories[name]}
-                    onChange={(e) => setVesselCategories({ ...vesselCategories, [name]: e.target.checked })}
-                  />
-                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: `rgb(${rgb})` }} aria-hidden="true" />
-                  {name}
-                </label>
-              ))}
-              {smallestVessel > 0 && <p className="mt-2 text-xs text-slate-400">{smallestVessel} m and longer at this zoom: closer in, smaller ones show.</p>}
-              <p className="mt-1 text-xs text-slate-400">
-                From{' '}
-                <a href="https://openwaters.io/ais/" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
-                  Open Waters AIS
-                </a>{' '}
-                and its sources, among them{' '}
-                <a href="https://www.aishub.net" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
-                  AISHub
-                </a>
-                . It doesn't reach every vessel, and little of the open ocean.
-              </p>
-            </fieldset>
-          )}
-
-          {show.warnings && (
-            <fieldset className="flex flex-col gap-1">
-              <legend className="mb-1 font-medium text-slate-400">Nav warning filters</legend>
-              <p role="status" className="text-slate-300">
-                {!warnings || warnings.loading
-                  ? 'Collecting warnings: the first time takes a minute or two'
-                  : `${filteredWarnings.length} of ${warnings.warnings.length} showing`}
-              </p>
-              {Object.entries(WARNING_CATEGORIES).map(([name, rgb]) => (
-                <label key={name} className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    className="accent-cyan-400"
-                    checked={warningCategories[name]}
-                    onChange={(e) => setWarningCategories({ ...warningCategories, [name]: e.target.checked })}
-                  />
-                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: `rgb(${rgb})` }} aria-hidden="true" />
-                  {name}
-                </label>
-              ))}
-              <label className="mt-2 flex flex-col gap-1 text-xs text-slate-400">
-                From
-                <select
-                  value={warningSource}
-                  onChange={(e) => setWarningSource(e.target.value)}
-                  className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
-                >
-                  <option value="">Everywhere</option>
-                  {warningSources.map((name) => (
-                    <option key={name} value={name}>
-                      {name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="mt-2 flex flex-col gap-1 text-xs text-slate-400">
-                Issued
-                <select
-                  value={warningAge}
-                  onChange={(e) => setWarningAge(Number(e.target.value))}
-                  className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
-                >
-                  {WARNING_AGES.map(([label, days]) => (
-                    <option key={days} value={days}>
-                      {label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {warnings?.cut?.length > 0 && (
-                <p className="mt-2 text-xs text-amber-300">
-                  Some warnings are missing: {cutFeeds(warnings.cut)} reached SeaLagom's limit of 100, so their oldest are left out.
-                </p>
-              )}
-              {warnings?.unplaced > 0 && (
-                <p className="mt-2 text-xs text-slate-400">{warnings.unplaced} more give no position, so aren't on the map.</p>
-              )}
-              <p className="mt-1 text-xs text-slate-400">
-                From{' '}
-                <a href="https://www.sealagom.com/" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
-                  SeaLagom
-                </a>{' '}
-                and the UK Hydrographic Office,{warnings?.checked ? ` checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}` : ' hourly'}
-              </p>
-            </fieldset>
-          )}
-
-          <fieldset className="flex flex-col gap-2">
-            <legend className="mb-1 font-medium text-slate-400">Depth contours</legend>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                className="accent-cyan-400"
-                checked={show.contours}
-                onChange={(e) => setShow({ ...show, contours: e.target.checked })}
-              />
-              Show contours
-            </label>
+          <Section title="Depth contours" className="gap-2">
+            <Toggle checked={show.contours} onChange={shows('contours')}>Show contours</Toggle>
             <div className="grid grid-cols-3 gap-2">
               {[
                 ['shallow', 'Shallow'],
@@ -918,40 +752,203 @@ export default function App() {
                 </label>
               ))}
             </div>
-            <label className="flex items-center gap-2">
+            <Toggle checked={show.ecdis} disabled={!show.contours} onChange={shows('ecdis')}>ECDIS depth colours</Toggle>
+          </Section>
+
+          <Section title="Your charts" className="gap-2">
+            <label
+              className={`relative block rounded-lg border border-dashed border-slate-500 p-4 text-center focus-within:ring-2 focus-within:ring-cyan-400 ${
+                compiling ? 'opacity-60' : 'hover:border-cyan-400'
+              }`}
+            >
+              <span>Drop .000 cells here, or click to choose</span>
               <input
-                type="checkbox"
-                className="accent-cyan-400"
-                checked={show.ecdis}
-                disabled={!show.contours}
-                onChange={(e) => setShow({ ...show, ecdis: e.target.checked })}
+                type="file"
+                accept=".000"
+                multiple
+                disabled={!!compiling}
+                className="absolute inset-0 cursor-pointer opacity-0 disabled:cursor-wait"
+                onChange={(e) => {
+                  upload([...e.target.files])
+                  e.target.value = ''
+                }}
               />
-              ECDIS depth colours
             </label>
-          </fieldset>
-
-          {charts.length > 0 && (
-            <ul className="flex flex-col gap-1">
-              {charts.map((c) => (
-                <li key={c.name} className="flex items-center gap-2">
-                  <span className="grow break-all">{c.name}</span>
-                  <span className="text-slate-400">1:{c.scale.toLocaleString()}</span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${c.name}`}
-                    onClick={() => removeUpload(c.name)}
-                    className="rounded px-1 text-slate-400 hover:text-red-400"
-                  >
-                    ×
-                  </button>
-                </li>
+            <div role="status" className="empty:hidden">
+              {compiling && (
+                <p className="flex items-center gap-2 break-all text-cyan-300">
+                  <span className="size-4 shrink-0 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" />
+                  Compiling {compiling}
+                </p>
+              )}
+              {error && <p className="text-red-400">{error}</p>}
+            </div>
+            {charts.length > 0 && (
+              <ul className="flex flex-col gap-1">
+                {charts.map((c) => (
+                  <li key={c.name} className="flex items-center gap-2">
+                    <span className="grow break-all">{c.name}</span>
+                    <span className="text-slate-400">1:{c.scale.toLocaleString()}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${c.name}`}
+                      onClick={() => removeUpload(c.name)}
+                      className="rounded px-1 text-slate-400 hover:text-red-400"
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+        </>
+      ),
+    },
+    {
+      id: 'vessels',
+      label: 'Vessels',
+      title: 'Vessels (AIS)',
+      icon: ICONS.vessels,
+      off: !show.vessels,
+      alert: show.vessels && vesselsFailed,
+      body: (
+        <>
+          <Toggle checked={show.vessels} onChange={shows('vessels')}>Show vessels</Toggle>
+          {show.vessels && (
+            <Section title="Filters">
+              <p role="status" className="text-slate-300">
+                {vesselsFailed ? 'No AIS data just now' : `${filteredVessels.length} of ${vessels.length} in view`}
+              </p>
+              {Object.entries(VESSEL_CATEGORIES).map(([name, rgb]) => (
+                <Toggle key={name} checked={vesselCategories[name]} onChange={(on) => setVesselCategories({ ...vesselCategories, [name]: on })}>
+                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: `rgb(${rgb})` }} aria-hidden="true" />
+                  {name}
+                </Toggle>
               ))}
-            </ul>
+              {smallestVessel > 0 && <p className={`mt-2 ${note}`}>{smallestVessel} m and longer at this zoom: closer in, smaller ones show.</p>}
+            </Section>
           )}
+          <p className={note}>
+            From{' '}
+            <a href="https://openwaters.io/ais/" target="_blank" rel="noreferrer" className={link}>
+              Open Waters AIS
+            </a>{' '}
+            and its sources, among them{' '}
+            <a href="https://www.aishub.net" target="_blank" rel="noreferrer" className={link}>
+              AISHub
+            </a>
+            . It doesn't reach every vessel, and little of the open ocean.
+          </p>
+        </>
+      ),
+    },
+    {
+      id: 'warnings',
+      label: 'Warnings',
+      title: 'Nav warnings',
+      icon: ICONS.warnings,
+      off: !show.warnings,
+      body: (
+        <>
+          <Toggle checked={show.warnings} onChange={shows('warnings')}>Show nav warnings</Toggle>
+          {show.warnings && (
+            <Section title="Filters">
+              <p role="status" className="text-slate-300">
+                {!warnings || warnings.loading
+                  ? 'Collecting warnings: the first time takes a minute or two'
+                  : `${filteredWarnings.length} of ${warnings.warnings.length} showing`}
+              </p>
+              {Object.entries(WARNING_CATEGORIES).map(([name, rgb]) => (
+                <Toggle key={name} checked={warningCategories[name]} onChange={(on) => setWarningCategories({ ...warningCategories, [name]: on })}>
+                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: `rgb(${rgb})` }} aria-hidden="true" />
+                  {name}
+                </Toggle>
+              ))}
+              <label className={`mt-2 flex flex-col gap-1 ${note}`}>
+                From
+                <select
+                  value={warningSource}
+                  onChange={(e) => setWarningSource(e.target.value)}
+                  className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
+                >
+                  <option value="">Everywhere</option>
+                  {warningSources.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className={`mt-2 flex flex-col gap-1 ${note}`}>
+                Issued
+                <select
+                  value={warningAge}
+                  onChange={(e) => setWarningAge(Number(e.target.value))}
+                  className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
+                >
+                  {WARNING_AGES.map(([label, days]) => (
+                    <option key={days} value={days}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {warnings?.cut?.length > 0 && (
+                <p className="mt-2 text-xs text-amber-300">
+                  Some warnings are missing: {cutFeeds(warnings.cut)} reached SeaLagom's limit of 100, so their oldest are left out.
+                </p>
+              )}
+              {warnings?.unplaced > 0 && <p className={`mt-2 ${note}`}>{warnings.unplaced} more give no position, so aren't on the map.</p>}
+            </Section>
+          )}
+          <p className={note}>
+            From{' '}
+            <a href="https://www.sealagom.com/" target="_blank" rel="noreferrer" className={link}>
+              SeaLagom
+            </a>{' '}
+            and the UK Hydrographic Office,{warnings?.checked ? ` checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}` : ' hourly'}
+          </p>
+        </>
+      ),
+    },
+    {
+      id: 'conditions',
+      label: 'Conditions',
+      title: 'Conditions',
+      icon: ICONS.conditions,
+      body: (
+        <Section title="Shown">
+          <Toggle checked={show.tide} onChange={shows('tide')}>Tide bar</Toggle>
+          <Toggle checked={show.daylight} onChange={shows('daylight')}>Day and night</Toggle>
+        </Section>
+      ),
+    },
+    {
+      id: 'about',
+      label: 'About',
+      title: 'ENC 3D',
+      icon: ICONS.about,
+      apart: true,
+      body: (
+        <>
+          <p className="font-medium text-amber-300">Not for navigation.</p>
+          <p className="text-slate-300">
+            NOAA's electronic navigational charts in 3D, kept up to date, with live tides, vessels and nav warnings.
+          </p>
+          <p className={note}>
+            Beyond the charts: seabed, GEBCO_2026 Grid; coast and buildings, © OpenStreetMap contributors. Basemap ©
+            CARTO. Vessels and warnings are credited in their own menus.
+          </p>
+        </>
+      ),
+    },
+  ]
 
-          <p className="text-xs text-slate-400">Beyond the charts: seabed, GEBCO_2026 Grid; coast, © OpenStreetMap contributors. Not for navigation.</p>
-        </aside>
-      </div>
+  return (
+    <div className="fixed inset-0 bg-slate-950">
+      <div ref={mapBox} className="h-full" />
+      <SideMenu menus={menus} />
       <SearchBar go={goTo} />
       <p
         role="status"

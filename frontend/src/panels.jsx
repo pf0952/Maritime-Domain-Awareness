@@ -105,7 +105,7 @@ export function SearchBar({ go }) {
     <form
       role="search"
       onSubmit={search}
-      className="absolute top-3 left-1/2 z-10 w-[min(26rem,calc(100%-2rem))] -translate-x-1/2 text-sm text-slate-100"
+      className="absolute top-3 right-4 left-22 z-10 text-sm text-slate-100 md:right-auto md:left-1/2 md:w-[26rem] md:-translate-x-1/2"
     >
       <input
         type="search"
