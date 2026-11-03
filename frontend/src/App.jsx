@@ -1,12 +1,13 @@
-import { PathLayer, PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
-import { OBJECTS_ZOOM, objectMeshes, vesselMesh } from './models'
+import { PathLayer, PolygonLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers'
+import { CURRENTS_ZOOM, OBJECTS_ZOOM, currentArrows, objectMeshes, vesselMesh } from './models'
+import { CRESTS, WIND_RGB, WeatherCanvas, directionAt, indexWeather, unpackLand, weatherAt } from './weather'
 import { MapboxOverlay } from '@deck.gl/mapbox'
 import { VectorTile } from '@mapbox/vector-tile'
 import * as maplibregl from 'maplibre-gl'
 import maplibreWorker from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import { PbfReader } from 'pbf'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { EMPTY, SOFTWARE, daylightAt, fromOutline, onOutline, overlaps, sunAt, tileAt, tileToLat, tileToLng } from './geo'
+import { EMPTY, SOFTWARE, daylightAt, fromOutline, onOutline, overlaps, rhumb, sunAt, tileAt, tileToLat, tileToLng } from './geo'
 import { AIDS, AIS, PLEASURE, VESSEL_CATEGORIES, VESSEL_DOT, VESSEL_FOUND_ZOOM, VESSEL_REFRESH, vesselAt, vesselCategory, vesselLengthAt, vesselShape, vesselTiles } from './vessels'
 import { ROMAN, WARNING_AGES, WARNING_CATEGORIES, WARNING_DOT, WARNING_DOT_PICKED, WARNING_EDGE, WARNING_FILL, WARNING_FILL_PICKED, cutFeeds, warningShapes, warningsAt } from './warnings'
 import { Charts, modelLayer, unpack } from './meshes'
@@ -44,6 +45,26 @@ const WARNINGS_RETRY = 15000 // ms: while the first ever look through the feeds 
 const GREY_AFTER = 250 // ms of loading before the screen greys, or every small pan would flash
 const UNGREY_AFTER = 150 // ms of quiet before it clears, as one thing's end can come just before the next one's start
 const LIGHT_DOT = 3 // px
+const BERTH_ZOOM = 15 // closer than this, vessels are drawn about true to size, and alongside quays they're set clear of them
+const STOPPED = 0.5 // knots
+const CURRENT_LABELS_ZOOM = 12 // further out, the arrows go without their speeds
+const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+const compass = (degrees) => COMPASS[Math.round(degrees / 45) % 8]
+const MEASURE_RGB = [253, 224, 71]
+// distances as a chart gives them, and short ones in metres too; bearings true, in three figures
+const miles = (nm) => (nm < 1 ? `${nm.toFixed(2)} nm (${Math.round(nm * 1852)} m)` : `${nm.toLocaleString([], { maximumFractionDigits: nm < 100 ? 2 : 1 })} nm`)
+const trueBearing = (degrees) => `${String(Math.round(degrees) % 360).padStart(3, '0')}°T`
+// how each shows on the map, as the key beside its switch
+const mark = (path, rgb, width) => (
+  <svg viewBox="0 0 24 12" className="h-3 w-6 shrink-0" aria-hidden="true">
+    <path d={path} fill="none" stroke={`rgb(${rgb})`} strokeWidth={width} strokeLinecap="round" />
+  </svg>
+)
+const WEATHER_KINDS = [
+  ['wind', 'Wind', mark('M2 3h12 M8 9h14', WIND_RGB, 1)],
+  ['waves', 'Waves', mark('M3 9q4-7 8 0 M13 9q4-7 8 0', CRESTS.waves.rgb, 1.8)],
+  ['swell', 'Swell', mark('M2 9q10-6 20 0', CRESTS.swell.rgb, 2.4)],
+]
 const allOf = (names) => Object.fromEntries(names.map((name) => [name, true]))
 
 // MapLibre finds its worker next to its own file, which bundling moves
@@ -155,6 +176,10 @@ export default function App() {
     contours: false,
     ecdis: true,
     daylight: true,
+    currents: true,
+    wind: false,
+    waves: false,
+    swell: false,
     warnings: false,
     vessels: true,
   })
@@ -163,6 +188,11 @@ export default function App() {
   const [charted, setCharted] = useState(true) // is any ENC in view?
   const [detailed, setDetailed] = useState(true) // is any in view fine enough to stand buildings on?
   const [tide, setTide] = useState(null)
+  const [view, setView] = useState(null) // the map's bounds, as of the last move
+  const [currents, setCurrents] = useState([]) // NOAA's current stations in view
+  const [weather, setWeather] = useState(null) // wind and waves on a grid over the view
+  const [weatherFailed, setWeatherFailed] = useState(false)
+  const [land, setLand] = useState(null) // where the land is in view, to keep waves and swell off it
   const [hour, setHour] = useState(0) // the tide being shown, from now
   const [compiling, setCompiling] = useState('')
   const [error, setError] = useState('')
@@ -176,6 +206,7 @@ export default function App() {
   const [pickedVessel, setPickedVessel] = useState(null)
   const [vesselDetail, setVesselDetail] = useState(null)
   const [vesselTrack, setVesselTrack] = useState(null)
+  const [vesselRoute, setVesselRoute] = useState(null) // backend/route.py's prediction, for the picked vessel
   const [warningSource, setWarningSource] = useState('')
   const [warningAge, setWarningAge] = useState(0)
   const [pickedWarnings, setPickedWarnings] = useState([]) // what's under the last click
@@ -183,6 +214,11 @@ export default function App() {
   const warningsOnMap = useRef({ boxes: [], dots: [] }) // for the map's own handlers
   const vesselsOnMap = useRef([])
   const trafficNow = useRef(EMPTY) // for the heatmap, when the map's style has loaded
+  const [measuring, setMeasuring] = useState(false) // clicks on the map add points to measure between
+  const [measured, setMeasured] = useState([]) // [lng, lat] of each point
+  const [aim, setAim] = useState(null) // where the cursor is, while measuring: the next leg runs to it
+  const measuringNow = useRef(false)
+  measuringNow.current = measuring
   const loadVessels = useRef(null)
   const vesselsOn = useRef(true)
   const overWarning = useRef(false)
@@ -260,7 +296,7 @@ export default function App() {
     // interleaved: one canvas and one graphics context, so the map and charts can't drift apart as they move
     overlay.current = new MapboxOverlay({
       interleaved: true,
-      getCursor: ({ isDragging }) => (isDragging ? 'grabbing' : overWarning.current ? 'pointer' : 'grab'),
+      getCursor: ({ isDragging }) => (isDragging ? 'grabbing' : measuringNow.current ? 'crosshair' : overWarning.current ? 'pointer' : 'grab'),
     })
     m.addControl(overlay.current)
     map.current = m
@@ -412,6 +448,7 @@ export default function App() {
       const { signal } = request
       const [[west, south], [east, north]] = m.getBounds().toArray()
       setZoom(m.getZoom())
+      setView({ west, south, east, north })
       const { clientWidth: width, clientHeight: height } = m.getCanvas()
       const corners = [[0, 0], [width, 0], [width, height], [0, height]].flatMap((p) => m.unproject(p).toArray())
       const tier = tierAt(m.getZoom())
@@ -455,17 +492,26 @@ export default function App() {
     }
     m.once('load', () => lightBuildings.current())
 
-    m.on('click', ({ point: { x, y } }) => {
+    m.on('click', ({ point: { x, y }, lngLat }) => {
+      if (measuringNow.current) {
+        setMeasured((points) => [...points, [lngLat.lng, lngLat.lat]])
+        return
+      }
       const vessel = vesselAt(m, vesselsOnMap.current, x, y)
       setPickedVessel(vessel)
       setPickedWarnings(vessel ? [] : warningsAt(m, warningsOnMap.current, x, y))
       setPickedTurn(0)
     })
     let hovering = null
-    m.on('mousemove', ({ point }) => {
+    m.on('mousemove', ({ point, lngLat }) => {
       if (hovering) return
       hovering = requestAnimationFrame(() => {
         hovering = null
+        if (measuringNow.current) {
+          setAim([lngLat.lng, lngLat.lat])
+          m.getCanvas().style.cursor = 'crosshair'
+          return
+        }
         const { x, y } = point
         overWarning.current = !!vesselAt(m, vesselsOnMap.current, x, y) || warningsAt(m, warningsOnMap.current, x, y).length > 0
         m.getCanvas().style.cursor = overWarning.current ? 'pointer' : 'grab'
@@ -522,6 +568,91 @@ export default function App() {
     vesselsOn.current = show.vessels
     loadVessels.current?.()
   }, [show.vessels, ready])
+
+  // currents and weather for the view: what's showing stays until the new arrives, and they never grey the screen
+  const wantCurrents = show.currents && zoom >= CURRENTS_ZOOM
+  useEffect(() => {
+    if (!view || !wantCurrents) return
+    const request = new AbortController()
+    fetch(`/api/currents?${new URLSearchParams(view)}`, { signal: request.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((answer) => answer && setCurrents(answer.stations))
+      .catch(() => {})
+    return () => request.abort()
+  }, [view, wantCurrents])
+
+  const wantWeather = show.wind || show.waves || show.swell
+  const wantLand = show.waves || show.swell
+  useEffect(() => {
+    if (!view || !wantWeather) return
+    const request = new AbortController()
+    fetch(`/api/weather?${new URLSearchParams(view)}`, { signal: request.signal })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(res.status))))
+      .then((answer) => {
+        setWeather(indexWeather(answer))
+        setWeatherFailed(false)
+      })
+      .catch((e) => e.name !== 'AbortError' && setWeatherFailed(true))
+    return () => request.abort()
+  }, [view, wantWeather])
+
+  useEffect(() => {
+    if (!view || !wantLand) return
+    setLand(null) // (the last view's would be in the wrong place)
+    const request = new AbortController()
+    fetch(`/api/landmask?${new URLSearchParams(view)}`, { signal: request.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((answer) => answer && setLand(unpackLand(answer)))
+      .catch(() => {})
+    return () => request.abort()
+  }, [view, wantLand])
+
+  // the legs measured, and while measuring, one more to the cursor
+  const legs = useMemo(() => {
+    const points = measuring && aim ? [...measured, aim] : measured
+    return points.slice(1).map((to, i) => ({ from: points[i], to, ...rhumb(points[i], to), live: measuring && !!aim && i === points.length - 2 }))
+  }, [measured, aim, measuring])
+  const measuredTotal = legs.filter((leg) => !leg.live).reduce((sum, leg) => sum + leg.nm, 0)
+  const stopMeasuring = () => {
+    setMeasuring(false)
+    setAim(null)
+  }
+  useEffect(() => {
+    if (!measuring) return
+    const stop = (e) => {
+      if (e.key !== 'Escape') return
+      setMeasuring(false)
+      setAim(null)
+    }
+    window.addEventListener('keydown', stop)
+    return () => window.removeEventListener('keydown', stop)
+  }, [measuring])
+
+  // the tide bar's hour, as the arrays of hours from currents and weather count them
+  const hourIndex = (show.tide ? hour : 0) + TIDE_HOURS
+  const currentSet = useMemo(
+    () => currentArrows(wantCurrents ? currents : [], hourIndex, Math.round(zoom * 4) / 4, (show.tide && tide?.levels?.[hourIndex]) || 0),
+    [currents, wantCurrents, hourIndex, zoom, show.tide, tide],
+  )
+
+  // the weather at the middle of the view, at the tide bar's hour
+  let weatherHere = null
+  if (weather && view) {
+    const [lng, lat] = [(view.west + view.east) / 2, (view.south + view.north) / 2]
+    const knots = weatherAt(weather, 'wind', hourIndex, lng, lat)
+    const windFrom = directionAt(weather, 'windFrom', hourIndex, lng, lat)
+    const sea = (height, from, period) => {
+      const metres = weatherAt(weather, height, hourIndex, lng, lat)
+      const way = directionAt(weather, from, hourIndex, lng, lat)
+      const seconds = period && weatherAt(weather, period, hourIndex, lng, lat)
+      return metres === null || way === null ? null : `${metres.toFixed(1)} m from ${compass(way)}${seconds ? `, ${Math.round(seconds)} s` : ''}`
+    }
+    weatherHere = {
+      wind: knots !== null && windFrom !== null ? `${Math.round(knots)} kn from ${compass(windFrom)}` : null,
+      waves: sea('sea', 'seaFrom'),
+      swell: sea('swell', 'swellFrom', 'swellPeriod'),
+    }
+  }
 
   const warningsLoading = show.warnings && (!warnings || warnings.loading)
   const firstLoads = (show.tide && !tideAsked) || (show.vessels && !vesselsAsked)
@@ -586,12 +717,45 @@ export default function App() {
     trafficNow.current = { ...EMPTY, features: traffic.map((v) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [v.lng, v.lat] }, properties: {} })) }
     map.current?.getSource('traffic')?.setData(trafficNow.current)
   }, [traffic])
-  const vesselShapes = useMemo(() => {
+  const reportedShapes = useMemo(() => {
     const middle = map.current?.getCenter().lng ?? 0
     // beyond the charts, harbours are painted on the land's top, not cut from it
     const base = charted ? level : LAND_TOP
     return vesselsDrawn.filter((v) => v.kind === 'vessel').map((v) => vesselShape(v, zoom, base, middle))
   }, [filteredVessels, show.vessels, zoom, level, charted, searched[0], heatmap])
+
+  // close in, stopped vessels that'd be drawn into a pier or quay are laid alongside it instead (backend/berths.py)
+  const [berths, setBerths] = useState({})
+  const berthing = zoom >= BERTH_ZOOM
+  // (as text, so the tide moving the shapes up and down doesn't ask again)
+  const stopped = useMemo(
+    () =>
+      JSON.stringify(
+        reportedShapes
+          .filter(({ vessel }) => vessel.nav_status === 5 || (vessel.sog ?? 0) < STOPPED)
+          .slice(0, 500)
+          .map(({ vessel, centre: [lng, lat], length, beam }) => ({ mmsi: vessel.mmsi, lng, lat, length, beam, hdg: vessel.hdg ?? null })),
+      ),
+    [reportedShapes],
+  )
+  useEffect(() => {
+    if (!berthing || stopped === '[]') return
+    const request = new AbortController()
+    fetch('/api/berths', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: stopped, signal: request.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((found) => found && setBerths(found))
+      .catch(() => {})
+    return () => request.abort()
+  }, [stopped, berthing])
+  const vesselShapes = useMemo(
+    () =>
+      reportedShapes.map((shape) => {
+        const berth = berthing && berths[shape.vessel.mmsi]
+        // (round the same copy of the world as the one it was sent from)
+        return berth ? { ...shape, centre: [berth.lng, berth.lat], vessel: { ...shape.vessel, hdg: berth.hdg } } : shape
+      }),
+    [reportedShapes, berths, berthing],
+  )
   const vesselDots = vesselsDrawn.filter((v) => v.kind !== 'vessel')
   const vesselModels = useMemo(() => vesselMesh(vesselShapes, pickedVessel?.mmsi, zoom), [vesselShapes, pickedVessel, zoom])
 
@@ -625,6 +789,21 @@ export default function App() {
     read('/track?interval=5m', (track) => setVesselTrack(track.geometry?.type === 'LineString' ? track.geometry.coordinates : null))
     return () => request.abort()
   }, [pickedVessel])
+
+  // where it's going, once its own record has said: the route there, and when it'll arrive with the weather on the way
+  useEffect(() => {
+    setVesselRoute(null)
+    const said = { ...pickedVessel, ...vesselDetail?.properties }
+    if (!pickedVessel || !vesselDetail || !said.destination) return
+    const request = new AbortController()
+    const query = { lng: pickedVessel.lng, lat: pickedVessel.lat, destination: said.destination }
+    for (const key of ['sog', 'cog', 'type', 'length', 'eta', 'seen']) if (said[key] !== undefined && said[key] !== null) query[key] = said[key]
+    fetch(`/api/route?${new URLSearchParams(query)}`, { signal: request.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then(setVesselRoute)
+      .catch(() => {})
+    return () => request.abort()
+  }, [pickedVessel, vesselDetail])
 
   useEffect(() => {
     const data = shown
@@ -667,6 +846,22 @@ export default function App() {
     })
     vesselsOnMap.current = vesselShapes
     const vesselLayer = modelLayer('vessels', vesselModels, level, sun, SKYLINE.id)
+    const currentLayer = modelLayer('currents', currentSet, level, sun, SKYLINE.id)
+    const currentLabels = new TextLayer({
+      id: 'current-labels',
+      beforeId: SKYLINE.id,
+      data: currentSet.labels,
+      visible: zoom >= CURRENT_LABELS_ZOOM && currentSet.labels.length > 0,
+      getPosition: (label) => label.position,
+      getText: (label) => label.text,
+      getSize: 11,
+      getColor: [226, 232, 240],
+      getPixelOffset: [0, 18],
+      background: true,
+      getBackgroundColor: [15, 23, 42, 190],
+      backgroundPadding: [3, 1],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
     const objectLayers = [...standing, ...afloat].map((set, i) => modelLayer(`objects-${i < standing.length ? 'standing' : 'afloat'}-${set.id}`, set, level, sun, SKYLINE.id))
     // lights shine at night only, and stay bright: they're not lit by the sun but their own
     const lights = lit ? [...standing, ...afloat].flatMap((set) => set.lights).filter(({ position: [lng, lat] }) => daylightAt(lng, lat, sun) < 0.5) : []
@@ -704,6 +899,85 @@ export default function App() {
       getColor: [255, 255, 255, 170],
       parameters: { depthCompare: 'always', depthWriteEnabled: false },
     })
+    // the predicted route ahead, in the colour of the track behind but fainter, with a mark every so many hours
+    const ahead = vesselRoute?.path ? [vesselRoute.path] : []
+    const routeLayer = new PathLayer({
+      id: 'vessel-route',
+      beforeId: SKYLINE.id,
+      data: ahead,
+      visible: ahead.length > 0,
+      widthUnits: 'pixels',
+      getPath: (path) => path,
+      getWidth: 2,
+      getColor: [103, 232, 249, 150],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    const ticks = vesselRoute?.ticks ?? []
+    const tickLayer = new ScatterplotLayer({
+      id: 'vessel-route-ticks',
+      beforeId: SKYLINE.id,
+      data: ticks,
+      visible: ticks.length > 0,
+      radiusUnits: 'pixels',
+      getPosition: (tick) => tick.position,
+      getRadius: 3,
+      getFillColor: [103, 232, 249, 220],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    const tickLabels = new TextLayer({
+      id: 'vessel-route-labels',
+      beforeId: SKYLINE.id,
+      data: ticks,
+      visible: ticks.length > 0,
+      getPosition: (tick) => tick.position,
+      getText: (tick) => (tick.hours % 24 ? `+${tick.hours} h` : `day ${tick.hours / 24}`),
+      getSize: 11,
+      getColor: [207, 250, 254],
+      getPixelOffset: [0, -12],
+      background: true,
+      getBackgroundColor: [15, 23, 42, 190],
+      backgroundPadding: [3, 1],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    const measureLegs = new PathLayer({
+      id: 'measure-legs',
+      data: legs,
+      visible: legs.length > 0,
+      widthUnits: 'pixels',
+      getPath: (leg) => [leg.from, leg.to],
+      getWidth: 2,
+      getColor: (leg) => [...MEASURE_RGB, leg.live ? 150 : 255],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    const measurePoints = new ScatterplotLayer({
+      id: 'measure-points',
+      data: measured,
+      visible: measured.length > 0,
+      radiusUnits: 'pixels',
+      lineWidthUnits: 'pixels',
+      stroked: true,
+      getPosition: (point) => point,
+      getRadius: 4,
+      getFillColor: MEASURE_RGB,
+      getLineColor: [15, 23, 42],
+      getLineWidth: 1.5,
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
+    const measureLabels = new TextLayer({
+      id: 'measure-labels',
+      data: legs,
+      visible: legs.length > 0,
+      getPosition: (leg) => [(leg.from[0] + leg.to[0]) / 2, (leg.from[1] + leg.to[1]) / 2],
+      getText: (leg) => `${miles(leg.nm)}  ${trueBearing(leg.bearing)}`,
+      characterSet: 'auto', // (its default letters have no degree sign)
+      getSize: 12,
+      getColor: [254, 249, 195],
+      background: true,
+      getBackgroundColor: [15, 23, 42, 210],
+      backgroundPadding: [4, 2],
+      getPixelOffset: [0, -12],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
     overlay.current?.setProps({
       layers: [
         new Charts({ id: 'charts', beforeId: INLAND_WATER.id, data, show, zoom, level, contours, sun }),
@@ -711,12 +985,20 @@ export default function App() {
         dotLayer,
         ...objectLayers,
         lightLayer,
+        currentLayer,
+        currentLabels,
         trackLayer,
+        routeLayer,
+        tickLayer,
+        tickLabels,
         vesselLayer,
         vesselDotLayer,
+        measureLegs,
+        measurePoints,
+        measureLabels,
       ].filter(Boolean),
     })
-  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, vesselModels, standing, afloat, vesselTrack])
+  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, vesselModels, standing, afloat, vesselTrack, currentSet, vesselRoute, legs, measured])
 
   useEffect(() => {
     if (map.current?.getLayer(INLAND_WATER.id)) {
@@ -995,9 +1277,85 @@ export default function App() {
       title: 'Conditions',
       icon: ICONS.conditions,
       body: (
-        <Section title="Shown">
-          <Toggle checked={show.tide} onChange={shows('tide')}>Tide bar</Toggle>
-          <Toggle checked={show.daylight} onChange={shows('daylight')}>Day and night</Toggle>
+        <>
+          <Section title="Shown">
+            <Toggle checked={show.tide} onChange={shows('tide')}>Tide bar</Toggle>
+            <Toggle checked={show.daylight} onChange={shows('daylight')}>Day and night</Toggle>
+          </Section>
+          <Section title="Tidal currents">
+            <Toggle checked={show.currents} onChange={shows('currents')}>Current arrows</Toggle>
+            <p className={note}>
+              {zoom < CURRENTS_ZOOM
+                ? 'Zoom in further to see them.'
+                : 'Predicted at NOAA stations, US waters only. Warmer and longer the stronger they run; a ring is slack.'}
+            </p>
+          </Section>
+          <Section title="Weather">
+            {WEATHER_KINDS.map(([key, label, mark]) => (
+              <Toggle key={key} checked={show[key]} onChange={shows(key)}>
+                {mark}
+                <span>{label}</span>
+                {show[key] && (
+                  <span className="ml-auto text-xs text-slate-300 tabular-nums">
+                    {weatherFailed ? 'none just now' : !weatherHere ? '…' : (weatherHere[key] ?? 'none here')}
+                  </span>
+                )}
+              </Toggle>
+            ))}
+            {wantWeather && <p className={note}>Values at the middle of the view.</p>}
+            <p className={note}>
+              Forecast and recent hours from{' '}
+              <a href="https://open-meteo.com/" target="_blank" rel="noreferrer" className={link}>Open-Meteo</a>, CC BY 4.0,
+              moving with the tide bar's clock.
+            </p>
+          </Section>
+        </>
+      ),
+    },
+    {
+      id: 'tools',
+      label: 'Tools',
+      title: 'Tools',
+      icon: ICONS.tools,
+      body: (
+        <Section title="Range and bearing" className="gap-2">
+          <button
+            type="button"
+            aria-pressed={measuring}
+            onClick={() => (measuring ? stopMeasuring() : setMeasuring(true))}
+            className={`rounded-lg px-3 py-1.5 font-medium ${measuring ? 'bg-yellow-300 text-slate-900' : 'bg-slate-800 text-yellow-200 hover:bg-slate-700'}`}
+          >
+            {measuring ? 'Stop measuring' : measured.length ? 'Measure on from here' : 'Measure'}
+          </button>
+          <p className={note}>
+            Click points on the map. Each leg is along the rhumb line, the straight line on the chart, with its true
+            bearing. Esc stops.
+          </p>
+          {legs.some((leg) => !leg.live) && (
+            <ol className="flex flex-col gap-0.5 text-xs tabular-nums">
+              {legs
+                .filter((leg) => !leg.live)
+                .map((leg, i) => (
+                  <li key={i} className="flex justify-between gap-3">
+                    <span className="text-slate-400">Leg {i + 1}</span>
+                    <span>
+                      {miles(leg.nm)}, {trueBearing(leg.bearing)}
+                    </span>
+                  </li>
+                ))}
+              {legs.filter((leg) => !leg.live).length > 1 && (
+                <li className="mt-1 flex justify-between gap-3 border-t border-slate-700 pt-1 font-medium">
+                  <span>Total</span>
+                  <span>{miles(measuredTotal)}</span>
+                </li>
+              )}
+            </ol>
+          )}
+          {measured.length > 0 && (
+            <button type="button" onClick={() => setMeasured([])} className="self-start rounded px-1 text-xs text-slate-300 underline hover:text-yellow-200">
+              Clear
+            </button>
+          )}
         </Section>
       ),
     },
@@ -1015,7 +1373,7 @@ export default function App() {
           </p>
           <p className={note}>
             Beyond the charts: seabed, GEBCO_2026 Grid; coast and buildings, © OpenStreetMap contributors. Basemap ©
-            CARTO. Vessels and warnings are credited in their own menus.
+            CARTO. Tides and currents, NOAA CO-OPS. Vessels, warnings and weather are credited in their own menus.
           </p>
         </>
       ),
@@ -1026,7 +1384,16 @@ export default function App() {
     <div className="fixed inset-0 bg-slate-950">
       <div ref={mapBox} className="h-full" />
       <SideMenu menus={menus} />
+      {ready && <WeatherCanvas map={map.current} weather={weather} land={land} hour={hourIndex} wind={show.wind} waves={show.waves} swell={show.swell} />}
       <SearchBar go={goTo} />
+      {measuring && (
+        <p role="status" className="absolute top-16 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-yellow-300/40 bg-slate-900/95 px-3 py-1.5 text-sm text-yellow-100 shadow-xl">
+          Measuring: click to add points{legs.length > 0 && `, ${miles(measuredTotal + (legs.at(-1).live ? legs.at(-1).nm : 0))} so far`}
+          <button type="button" onClick={stopMeasuring} className="rounded bg-yellow-300 px-2 py-0.5 text-xs font-medium text-slate-900">
+            Done
+          </button>
+        </p>
+      )}
       <p
         role="status"
         aria-hidden={charted || zoom < NO_ENC_ZOOM}
@@ -1092,7 +1459,7 @@ export default function App() {
           </a>
         </section>
       )}
-      {pickedVessel && <VesselCard vessel={pickedVessel} detail={vesselDetail} close={() => setPickedVessel(null)} />}
+      {pickedVessel && <VesselCard vessel={pickedVessel} detail={vesselDetail} route={vesselRoute} close={() => setPickedVessel(null)} />}
       {show.tide && <TidePanel tide={tide} hour={hour} setHour={setHour} />}
       <div className="absolute right-13 bottom-10 hidden origin-bottom-right scale-[0.45] items-end gap-5 transition-transform duration-200 hover:scale-100 focus-within:scale-100 md:flex">
         <div className="cube-scene">

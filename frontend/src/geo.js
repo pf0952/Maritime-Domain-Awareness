@@ -23,6 +23,20 @@ export const fromOutline = (x, y) => ({
   lat: (Math.atan(Math.sinh(((180 - y) * Math.PI) / 180)) * 180) / Math.PI,
 })
 
+// From one point to the next along the rhumb line, the straight line on a Mercator chart that a course holds: nautical
+// miles, and the true bearing in degrees
+export function rhumb([lng1, lat1], [lng2, lat2]) {
+  const r = Math.PI / 180
+  const [p1, p2] = [lat1 * r, lat2 * r]
+  const across = ((((lng2 - lng1) * r + 3 * Math.PI) % (2 * Math.PI)) - Math.PI) // the short way round
+  const stretched = mercator(lat2) - mercator(lat1)
+  const q = Math.abs(stretched) > 1e-12 ? (p2 - p1) / stretched : Math.cos(p1) // (due east or west)
+  return {
+    nm: 3440.065 * Math.hypot(p2 - p1, q * across),
+    bearing: ((Math.atan2(across, stretched) / r) % 360 + 360) % 360,
+  }
+}
+
 export const overlaps = (w, s, e, n) => ([west, south, east, north]) => w < east && e > west && s < north && n > south
 
 // where the sun is overhead at some moment: near enough to a tenth of a degree for centuries either side of 2000

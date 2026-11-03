@@ -16,16 +16,20 @@ from pathlib import Path
 
 import numpy as np
 import shapely
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pyogrio.errors import DataLayerError, DataSourceError
 
+import berths
 import charts
+import currents
 import navwarnings
+import route
 import sync
 import tides
+import weather
 
 MAX_BYTES = 64 * 1024 * 1024  # S-57 cells are 5 MB at most
 UNREADABLE = (DataSourceError, DataLayerError, ValueError)
@@ -150,6 +154,60 @@ def places_from(rows: list) -> list:
         south, north, west, east = map(float, row["boundingbox"])
         places.append({"name": row["display_name"], "bounds": [west, south, east, north]})
     return places
+
+
+@app.get("/api/currents")
+def get_currents(west: float, south: float, east: float, north: float):
+    """Tidal currents at NOAA's stations in an area, hour by hour across the tide bar."""
+    try:
+        return currents.in_view(west, south, east, north)
+    except (OSError, ValueError) as e:
+        raise HTTPException(503, f"No current predictions just now: {e}")
+
+
+@app.get("/api/weather")
+def get_weather(west: float, south: float, east: float, north: float):
+    """Wind and waves on a grid over an area, hour by hour across the tide bar."""
+    try:
+        return weather.in_view(west, south, east, north)
+    except (OSError, ValueError, KeyError) as e:
+        raise HTTPException(503, f"No weather just now: {e}")
+
+
+@app.get("/api/landmask")
+def get_land_mask(west: float, south: float, east: float, north: float):
+    """Where the land is in an area, so waves and swell can be kept off it."""
+    if east - west > 400 or north - south > 180:
+        raise HTTPException(422, "That's more than the world")
+    try:
+        return weather.land_mask(west, south, east, north)
+    except (OSError, ValueError) as e:
+        raise HTTPException(503, f"No land just now: {e}")
+
+
+@app.post("/api/berths")
+def post_berths(vessels: list[dict] = Body(..., max_length=500)):
+    """Stopped vessels' positions, headings and sizes: where to draw any that'd lie in the land, alongside it."""
+    try:
+        clean = [{"mmsi": v["mmsi"], "lng": float(v["lng"]), "lat": float(v["lat"]), "length": float(v["length"]),
+                  "beam": float(v["beam"]), "hdg": None if v.get("hdg") is None else float(v["hdg"])} for v in vessels]
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(422, "Each vessel needs mmsi, lng, lat, length and beam")
+    try:
+        return berths.adjust([v for v in clean if 0 < v["length"] < 500 and 0 < v["beam"] < 100])
+    except (OSError, ValueError, UNREADABLE) as e:
+        raise HTTPException(503, f"No berths just now: {e}")
+
+
+@app.get("/api/route")
+def get_route(lng: float, lat: float, destination: str = Query("", max_length=100), sog: float | None = None,
+              type: int | None = None, length: float | None = None, eta: str | None = Query(None, max_length=20),
+              cog: float | None = None, seen: str | None = Query(None, max_length=40)):
+    """A vessel's likely route to its AIS destination, and when it'll get there with the forecast weather on the way."""
+    try:
+        return route.predict(lng, lat, destination, sog, type, length, eta, cog, seen)
+    except (OSError, ValueError, KeyError) as e:
+        raise HTTPException(503, f"No route just now: {e}")
 
 
 @app.get("/api/search")

@@ -69,8 +69,14 @@ export function vesselTiles(m) {
 
 // where to draw a vessel and how big (models.js draws it): true length and beam, unless too small on screen to see
 export function vesselShape(vessel, zoom, level, middle) {
-  const { lat } = vessel
-  const lng = vessel.lng + 360 * Math.round((middle - vessel.lng) / 360)
+  // its position is its GPS aerial's, which can be well aft or off to one side: the hull's middle is from that
+  const { to_bow: bow, to_stern: stern, to_port: port, to_starboard: starboard } = vessel
+  const ahead = bow && stern ? (bow - stern) / 2 : 0
+  const aside = port && starboard ? (starboard - port) / 2 : 0
+  const turn = ((vessel.hdg ?? 0) * Math.PI) / 180
+  const across = 111320 * Math.cos((vessel.lat * Math.PI) / 180)
+  const lat = vessel.lat + (ahead * Math.cos(turn) - aside * Math.sin(turn)) / 111320
+  const lng = vessel.lng + (ahead * Math.sin(turn) + aside * Math.cos(turn)) / across + 360 * Math.round((middle - vessel.lng) / 360)
   const metresPerPixel = (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
   const [smallest, largest] = VESSEL_LENGTH_PX
   const least = (smallest + ((largest - smallest) * Math.min(zoom, VESSEL_ALL_ZOOM)) / VESSEL_ALL_ZOOM) * metresPerPixel

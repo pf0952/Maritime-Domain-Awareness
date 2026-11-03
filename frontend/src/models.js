@@ -511,6 +511,46 @@ export function objectMeshes(things, zoom, level, afloat) {
   return { mesh: p.mesh(), origin, lights }
 }
 
+export const CURRENTS_ZOOM = 9 // further out, the stations would be a heap of arrows
+const CURRENT_PX = [22, 12] // an arrow's length on screen: this much, and so much more a knot
+const SLACK = 0.2 // knots: weaker than this, a station's at slack, and shows a ring rather than an arrow
+const CURRENT_COLOURS = [[0, [150, 172, 192]], [1, [214, 190, 120]], [2, [226, 140, 64]], [3.5, [206, 72, 52]]] // by knots
+
+function currentColour(knots) {
+  const i = CURRENT_COLOURS.findIndex(([k]) => k > knots)
+  if (i === -1) return CURRENT_COLOURS.at(-1)[1]
+  if (i === 0) return CURRENT_COLOURS[0][1]
+  const [[k0, a], [k1, b]] = [CURRENT_COLOURS[i - 1], CURRENT_COLOURS[i]]
+  return a.map((c, j) => Math.round(c + ((b[j] - c) * (knots - k0)) / (k1 - k0)))
+}
+
+// Tidal currents at their stations (backend/currents.py) for one hour, as flat arrows on the water pointing the way
+// it flows, longer and warmer the stronger it runs; and the labels to go with them
+export function currentArrows(stations, hour, zoom, level) {
+  const p = new Parts()
+  const origin = stations.length ? [Math.round(stations[0].lng), Math.round(stations[0].lat)] : [0, 0]
+  const labels = []
+  for (const s of stations) {
+    const knots = s.knots[hour]
+    if (knots === null || knots === undefined) continue
+    const towards = knots >= 0 ? s.flood : s.ebb
+    const strength = Math.abs(knots)
+    const long = (CURRENT_PX[0] + CURRENT_PX[1] * strength) * metresPerPixel(s.lat, zoom)
+    const colour = currentColour(strength)
+    p.place(s.lng - origin[0], s.lat - origin[1], level + 0.3, s.lat, 1, towards ?? 0)
+    const thick = 0.04 * long
+    if (strength < SLACK || towards === null || towards === undefined) {
+      p.lathe([[0.15 * long, 0], [0.15 * long, thick]], plain(colour), 8)
+    } else {
+      const [head, shaft] = [0.38 * long, 0.09 * long]
+      p.prism([[0, long / 2], [-0.28 * long, long / 2 - head], [0.28 * long, long / 2 - head]], 0, thick, colour)
+      p.box(0, -head / 2, 0, 2 * shaft, long - head, thick, colour)
+    }
+    labels.push({ position: [s.lng, s.lat], text: strength < SLACK ? 'slack' : `${strength.toFixed(1)} kn`, name: s.name })
+  }
+  return { mesh: p.mesh(), origin, labels }
+}
+
 // Every vessel as one mesh, each a model of its type: small on screen, without the bits too small to see, as a CPU
 // drawing the whole of Rotterdam's traffic in full would fall to 10 frames a second
 export function vesselMesh(shapes, pickedMmsi, zoom) {

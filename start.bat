@@ -5,8 +5,9 @@ cd /d "%~dp0"
 if not exist backend\.venv\Scripts\python.exe (
   echo Setting up Python...
   python -m venv backend\.venv || goto failed
-  backend\.venv\Scripts\python -m pip install --disable-pip-version-check -q -r backend\requirements.txt || goto failed
 )
+rem every time, as an update can need a new package; it's quick when there's nothing to do
+backend\.venv\Scripts\python -m pip install --disable-pip-version-check -q -r backend\requirements.txt || goto failed
 if not exist frontend\dist\index.html (
   echo Building the viewer...
   pushd frontend

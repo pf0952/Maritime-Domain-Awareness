@@ -1,5 +1,6 @@
 // The cards over the map: tide, search, a picked vessel, and the loading screen
 import { useRef, useState } from 'react'
+import { offshoreKind } from './models'
 import { AIS, VESSELS_FOUND, aisValue, vesselCategory } from './vessels'
 
 export const TIDE_HOURS = 120 // either side of now
@@ -70,6 +71,37 @@ export function TidePanel({ tide, hour, setHour }) {
   )
 }
 
+const OFFSHORE_NAMES = { supply: 'Supply vessel', drillship: 'Drillship', semisub: 'Semi-submersible rig', jackup: 'Jack-up rig' }
+const countries = new Intl.DisplayNames(['en'], { type: 'region' })
+const country = (code) => {
+  try {
+    return countries.of(code)
+  } catch {
+    return code // (not a code it knows)
+  }
+}
+
+// a vessel as search lists it: its flag, name, then what it is and how big
+function VesselFound({ vessel }) {
+  const flag = /^[A-Z]{2}$/.test(vessel.flag ?? '') ? vessel.flag : null
+  const kind = OFFSHORE_NAMES[offshoreKind(vessel)] ?? vesselCategory(vessel)
+  const size = vessel.length ? `${vessel.length}${vessel.beam ? ` × ${vessel.beam}` : ''} m` : null
+  return (
+    <span className="flex items-center gap-2">
+      {/* (Windows draws no flag emoji, so these are pictures, from flagcdn.com) */}
+      {flag ? (
+        <img src={`https://flagcdn.com/w40/${flag.toLowerCase()}.png`} alt="" width="20" height="14" className="h-3.5 w-5 shrink-0 rounded-[2px] object-cover" onError={(e) => (e.currentTarget.style.visibility = 'hidden')} />
+      ) : (
+        <span className="h-3.5 w-5 shrink-0 rounded-[2px] bg-slate-700" aria-hidden="true" />
+      )}
+      <span className="min-w-0">
+        <span className="block truncate">{vessel.name || `MMSI ${vessel.mmsi}`}</span>
+        <span className="block truncate text-xs text-slate-400">{[kind, size, flag && country(flag)].filter(Boolean).join(' · ')}</span>
+      </span>
+    </span>
+  )
+}
+
 export function SearchBar({ go }) {
   const [query, setQuery] = useState('')
   const [places, setPlaces] = useState([])
@@ -87,7 +119,7 @@ export function SearchBar({ go }) {
       fetch(`${AIS}?q=${q}`).then((res) => (res.ok ? res.json() : null), () => null),
     ])
     const vessels = (ships?.features ?? []).slice(0, VESSELS_FOUND).map(({ geometry: { coordinates: [lng, lat] }, properties }) => ({
-      name: `${properties.name || properties.mmsi} (vessel, ${vesselCategory(properties)})`,
+      name: properties.name || String(properties.mmsi),
       vessel: { ...properties, hdg: properties.heading ?? properties.cog, lng, lat },
     }))
     // a ship named exactly so, or its MMSI, comes before places, unless a place is named so too: Rotterdam is a barge
@@ -95,6 +127,7 @@ export function SearchBar({ go }) {
     const exact =
       vessels.some(({ vessel }) => [vessel.name, String(vessel.mmsi)].includes(asked)) &&
       !(towns ?? []).some((town) => town.name.split(',')[0].trim().toUpperCase() === asked)
+    // as two groups, whichever's likelier first
     const found = exact ? [...vessels, ...(towns ?? [])] : [...(towns ?? []), ...vessels]
     setNote(towns || ships ? (found.length ? '' : 'Nothing found') : "Search isn't available just now")
     setPlaces(found)
@@ -124,29 +157,71 @@ export function SearchBar({ go }) {
       />
       {note && <p className="mt-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">{note}</p>}
       {places.length > 1 && (
-        <ul className="mt-1 overflow-hidden rounded-lg border border-slate-700 bg-slate-900 shadow-xl">
-          {places.map((place, i) => (
-            <li key={`${i} ${place.name}`}>
-              <button
-                type="button"
-                onClick={() => {
-                  go(place)
-                  setPlaces([])
-                }}
-                className="block w-full truncate px-3 py-2 text-left hover:bg-slate-800 focus:bg-slate-800"
-              >
-                {place.name}
-              </button>
-            </li>
+        <div className="mt-1 max-h-[70vh] overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl [scrollbar-color:#475569_transparent] [scrollbar-width:thin]">
+          {[...new Set(places.map((place) => (place.vessel ? 'Vessels' : 'Places')))].map((group) => (
+            <section key={group} aria-label={group}>
+              <h3 className="px-3 pt-2 pb-1 text-xs font-medium tracking-wide text-slate-400 uppercase">{group}</h3>
+              <ul>
+                {places
+                  .filter((place) => (place.vessel ? 'Vessels' : 'Places') === group)
+                  .map((place, i) => (
+                    <li key={`${i} ${place.name}`}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          go(place)
+                          setPlaces([])
+                        }}
+                        className="block w-full truncate px-3 py-1.5 text-left hover:bg-slate-800 focus:bg-slate-800"
+                      >
+                        {place.vessel ? <VesselFound vessel={place.vessel} /> : place.name}
+                      </button>
+                    </li>
+                  ))}
+              </ul>
+            </section>
           ))}
-        </ul>
+        </div>
       )}
     </form>
   )
 }
 
+const when = (seconds) =>
+  new Date(seconds * 1000).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })
+const hoursApart = (a, b) => {
+  const h = Math.round((a - b) / 3600)
+  return h === 0 ? 'the same as' : `${Math.abs(h)} h ${h > 0 ? 'later than' : 'earlier than'}`
+}
+
+// where backend/route.py thinks it's going, and when it'll get there
+function RoutePrediction({ route }) {
+  if (!route) return null
+  if (!route.port) {
+    return <p className="text-xs text-slate-400">Destination “{route.said}” isn't in the port list, so there's no route to predict.</p>
+  }
+  const delay = Math.round((route.arrive - route.calmArrive) / 3600)
+  const stale = Math.round((Date.now() / 1000 - route.from) / 3600)
+  return (
+    <div className="flex flex-col gap-0.5 rounded-lg bg-cyan-400/10 px-3 py-2 text-xs">
+      <p className="font-medium text-cyan-300">
+        Predicted arrival at {route.port.name}: {when(route.arrive)}
+      </p>
+      <p className="text-slate-300">
+        {route.miles.toLocaleString()} nm at {route.knots} kn
+        {delay > 0 ? `, ${delay} h lost to seas up to ${route.worstWaves} m` : route.worstWaves ? `, seas up to ${route.worstWaves} m` : ''}.
+        {route.aisEta && ` That's ${hoursApart(route.arrive, route.aisEta)} its own ETA.`}
+      </p>
+      <p className="text-slate-400">
+        {stale >= 2 && `From its last report, ${stale} h ago. `}By the usual shipping lanes and the forecast weather: a guess,
+        not its plan.
+      </p>
+    </div>
+  )
+}
+
 // every field it has sent: the map's tiles carry a few, and the rest comes from the vessel's own record
-export function VesselCard({ vessel, detail, close }) {
+export function VesselCard({ vessel, detail, route, close }) {
   const { particulars = {}, ...fields } = detail?.properties ?? vessel
   const shown = ([key, value]) => value !== null && value !== '' && typeof value !== 'object' && !['lng', 'lat', 'mmsi', 'name'].includes(key)
   const row = ([key, value]) => (
@@ -169,6 +244,7 @@ export function VesselCard({ vessel, detail, close }) {
           ×
         </button>
       </header>
+      <RoutePrediction route={route} />
       <dl className="flex flex-col gap-0.5 text-xs">{Object.entries(fields).filter(shown).map(row)}</dl>
       {Object.keys(particulars).length > 0 && (
         <dl className="flex flex-col gap-0.5 border-t border-slate-700 pt-2 text-xs">{Object.entries(particulars).filter(shown).map(row)}</dl>

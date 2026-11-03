@@ -5,5 +5,6 @@ mapbox_earcut==2.1.0
 pyogrio==0.13.0
 python-multipart==0.0.32
 rasterio==1.5.2
+searoute==1.6.0
 shapely==2.2.0
 uvicorn==0.54.0
