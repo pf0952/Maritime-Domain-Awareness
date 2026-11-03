@@ -1,4 +1,5 @@
 import { PathLayer, PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
+import { OBJECTS_ZOOM, objectMeshes, vesselMesh } from './models'
 import { MapboxOverlay } from '@deck.gl/mapbox'
 import { VectorTile } from '@mapbox/vector-tile'
 import * as maplibregl from 'maplibre-gl'
@@ -8,7 +9,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { EMPTY, SOFTWARE, daylightAt, fromOutline, onOutline, overlaps, sunAt, tileAt, tileToLat, tileToLng } from './geo'
 import { AIDS, AIS, PLEASURE, VESSEL_CATEGORIES, VESSEL_DOT, VESSEL_FOUND_ZOOM, VESSEL_REFRESH, vesselAt, vesselCategory, vesselLengthAt, vesselShape, vesselTiles } from './vessels'
 import { ROMAN, WARNING_AGES, WARNING_CATEGORIES, WARNING_DOT, WARNING_DOT_PICKED, WARNING_EDGE, WARNING_FILL, WARNING_FILL_PICKED, cutFeeds, warningShapes, warningsAt } from './warnings'
-import { Charts, unpack } from './meshes'
+import { Charts, modelLayer, unpack } from './meshes'
 import { ICONS, Section, SideMenu, Toggle } from './menu'
 import { LoadingScreen, SearchBar, TIDE_HOURS, TidePanel, VesselCard, syncMessage } from './panels'
 
@@ -42,6 +43,7 @@ const WARNINGS_LAG = 180000 // ms after the hour
 const WARNINGS_RETRY = 15000 // ms: while the first ever look through the feeds is going on
 const GREY_AFTER = 250 // ms of loading before the screen greys, or every small pan would flash
 const UNGREY_AFTER = 150 // ms of quiet before it clears, as one thing's end can come just before the next one's start
+const LIGHT_DOT = 3 // px
 const allOf = (names) => Object.fromEntries(names.map((name) => [name, true]))
 
 // MapLibre finds its worker next to its own file, which bundling moves
@@ -82,6 +84,28 @@ const BUILDINGS = {
   minzoom: BUILDINGS_ZOOM,
 }
 
+// vessels' traffic, warm on the blue of the sea: the map's own heatmap, which only shows further out than this
+const HEATMAP_ZOOM = 9
+const TRAFFIC = {
+  id: 'traffic',
+  type: 'heatmap',
+  source: 'traffic',
+  maxzoom: HEATMAP_ZOOM,
+  paint: {
+    'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 2, 5, HEATMAP_ZOOM, 20],
+    'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 2, 0.5, HEATMAP_ZOOM, 1.5],
+    'heatmap-opacity': 0.85,
+    'heatmap-color': [
+      'interpolate', ['linear'], ['heatmap-density'],
+      0, 'rgba(0, 0, 0, 0)',
+      0.1, 'rgba(254, 224, 139, 0.35)',
+      0.4, 'rgba(253, 174, 97, 0.7)',
+      0.7, 'rgb(244, 109, 67)',
+      1, 'rgb(255, 240, 225)',
+    ],
+  },
+}
+
 // the tiles of the skyline in view that a detailed chart reaches, nearest the middle first
 function skylineTiles(m, detailed) {
   const bounds = m.getBounds() // (past 180 on later copies of the world; tile numbers come back round)
@@ -113,6 +137,7 @@ export default function App() {
   const overview = useRef(null)
   const footprint = useRef(null)
   const [shown, setShown] = useState([]) // the charts in view
+  const [objects, setObjects] = useState([]) // their buoys, landmarks and the like, when close enough in: { id, things }
   const [charts, setCharts] = useState([]) // the ones uploaded
   const [loading, setLoading] = useState(false)
   const [tideAsked, setTideAsked] = useState(false) // only the first time: after that the last levels stand meanwhile
@@ -125,6 +150,7 @@ export default function App() {
     depare: true,
     lndare: true,
     buildings: true,
+    objects: true,
     tide: true,
     contours: false,
     ecdis: true,
@@ -156,6 +182,7 @@ export default function App() {
   const [pickedTurn, setPickedTurn] = useState(0) // which of them is showing
   const warningsOnMap = useRef({ boxes: [], dots: [] }) // for the map's own handlers
   const vesselsOnMap = useRef([])
+  const trafficNow = useRef(EMPTY) // for the heatmap, when the map's style has loaded
   const loadVessels = useRef(null)
   const vesselsOn = useRef(true)
   const overWarning = useRef(false)
@@ -219,13 +246,13 @@ export default function App() {
       const kept = style.layers
         .filter((l) => !HEAVY_BASEMAP.test(l.id))
         .map((l) => (l.type === 'background' ? { ...l, paint: { 'background-color': OCEAN } } : l))
-      kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, INLAND_WATER, SKYLINE, BUILDINGS)
+      kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, INLAND_WATER, SKYLINE, BUILDINGS, TRAFFIC)
       return kept
     }
     m.setStyle(BASEMAP, {
       transformStyle: (_, style) => ({
         ...style,
-        sources: { ...style.sources, skyline: { type: 'geojson', data: EMPTY } },
+        sources: { ...style.sources, skyline: { type: 'geojson', data: EMPTY }, traffic: { type: 'geojson', data: trafficNow.current } },
         layers: layers(style),
       }),
     })
@@ -239,7 +266,23 @@ export default function App() {
     map.current = m
 
     const have = new Map() // key: chart
+    const haveObjects = new Map() // key: its objects
     let request = null
+
+    // ponytail: keeps every chart's objects seen this visit; a few kB each, so drop old ones if a long session grows
+    async function loadObjects(want, signal) {
+      if (m.getZoom() < OBJECTS_ZOOM) return
+      const enc = want.filter((c) => !/^(WORLD|COAST_|SEA_)/.test(c.name))
+      await Promise.all(
+        enc
+          .filter((c) => !haveObjects.has(c.key))
+          .map(async (c) => {
+            const res = await fetch(`/api/objects/${c.name}/${c.tier}?key=${c.key}`, { signal })
+            if (res.ok) haveObjects.set(c.key, await res.json())
+          }),
+      )
+      setObjects(enc.filter((c) => haveObjects.has(c.key)).map((c) => ({ id: c.key, things: haveObjects.get(c.key) })))
+    }
 
     let tideRequest = null
 
@@ -393,6 +436,7 @@ export default function App() {
         const keys = new Set(want.map((c) => c.key))
         for (const key of have.keys()) if (!keys.has(key)) have.delete(key)
         setShown(want.filter((c) => have.has(c.key)).map((c) => have.get(c.key)))
+        await loadObjects(want, signal)
         setLoading(false)
       } catch (e) {
         if (e.name !== 'AbortError') setLoading(false) // (a newer refresh has taken over otherwise)
@@ -531,14 +575,37 @@ export default function App() {
   )
   // one picked from a search shows even if the live tiles don't have it (heard too long ago, say) or it's filtered out
   const searched = pickedVessel && !filteredVessels.some((v) => v.mmsi === pickedVessel.mmsi) ? [pickedVessel] : []
-  const vesselsDrawn = show.vessels ? [...filteredVessels, ...searched] : []
+  // further out, a heatmap of them all rather than a jumble of ships
+  const heatmap = zoom < HEATMAP_ZOOM
+  const vesselsDrawn = show.vessels ? [...(heatmap ? [] : filteredVessels), ...searched] : []
+  const traffic = useMemo(
+    () => (show.vessels ? vessels.filter((v) => v.kind === 'vessel' && vesselCategories[vesselCategory(v)]) : []),
+    [vessels, vesselCategories, show.vessels],
+  )
+  useEffect(() => {
+    trafficNow.current = { ...EMPTY, features: traffic.map((v) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [v.lng, v.lat] }, properties: {} })) }
+    map.current?.getSource('traffic')?.setData(trafficNow.current)
+  }, [traffic])
   const vesselShapes = useMemo(() => {
     const middle = map.current?.getCenter().lng ?? 0
     // beyond the charts, harbours are painted on the land's top, not cut from it
     const base = charted ? level : LAND_TOP
     return vesselsDrawn.filter((v) => v.kind === 'vessel').map((v) => vesselShape(v, zoom, base, middle))
-  }, [filteredVessels, show.vessels, zoom, level, charted, searched[0]])
+  }, [filteredVessels, show.vessels, zoom, level, charted, searched[0], heatmap])
   const vesselDots = vesselsDrawn.filter((v) => v.kind !== 'vessel')
+  const vesselModels = useMemo(() => vesselMesh(vesselShapes, pickedVessel?.mmsi, zoom), [vesselShapes, pickedVessel, zoom])
+
+  // rebuilt as the zoom changes, as each is kept big enough on screen to see; what floats, as the tide changes too
+  const objectZoom = Math.round(zoom * 4) / 4
+  const objectsDrawn = useMemo(() => (show.objects && objectZoom >= OBJECTS_ZOOM ? objects : []), [objects, show.objects, objectZoom])
+  const standing = useMemo(
+    () => objectsDrawn.map(({ id, things }) => ({ id, ...objectMeshes(things, objectZoom, 0, false) })),
+    [objectsDrawn, objectZoom],
+  )
+  const afloat = useMemo(
+    () => objectsDrawn.map(({ id, things }) => ({ id, ...objectMeshes(things, objectZoom, level, true) })),
+    [objectsDrawn, objectZoom, level],
+  )
 
   useEffect(() => {
     setVesselDetail(null)
@@ -599,19 +666,21 @@ export default function App() {
       parameters: { depthCompare: 'always', depthWriteEnabled: false },
     })
     vesselsOnMap.current = vesselShapes
-    const vesselColour = ({ vessel }) =>
-      vessel.mmsi === pickedVessel?.mmsi ? [255, 255, 255] : VESSEL_CATEGORIES[vesselCategory(vessel)]
-    const vesselLayer = new PolygonLayer({
-      id: 'vessels',
+    const vesselLayer = modelLayer('vessels', vesselModels, level, sun, SKYLINE.id)
+    const objectLayers = [...standing, ...afloat].map((set, i) => modelLayer(`objects-${i < standing.length ? 'standing' : 'afloat'}-${set.id}`, set, level, sun, SKYLINE.id))
+    // lights shine at night only, and stay bright: they're not lit by the sun but their own
+    const lights = lit ? [...standing, ...afloat].flatMap((set) => set.lights).filter(({ position: [lng, lat] }) => daylightAt(lng, lat, sun) < 0.5) : []
+    const lightLayer = new ScatterplotLayer({
+      id: 'lights',
       beforeId: SKYLINE.id,
-      data: vesselShapes,
-      visible: vesselShapes.length > 0,
-      extruded: true,
-      material: false,
-      getPolygon: (shape) => shape.ring,
-      getElevation: (shape) => shape.height,
-      getFillColor: vesselColour,
-      updateTriggers: { getFillColor: pickedVessel?.mmsi },
+      data: lights,
+      visible: lights.length > 0,
+      billboard: true,
+      radiusUnits: 'pixels',
+      getPosition: (light) => light.position,
+      getRadius: LIGHT_DOT,
+      getFillColor: (light) => light.color,
+      parameters: { depthWriteEnabled: false },
     })
     const vesselDotLayer = new ScatterplotLayer({
       id: 'vessel-dots',
@@ -640,12 +709,14 @@ export default function App() {
         new Charts({ id: 'charts', beforeId: INLAND_WATER.id, data, show, zoom, level, contours, sun }),
         boxLayer,
         dotLayer,
+        ...objectLayers,
+        lightLayer,
         trackLayer,
         vesselLayer,
         vesselDotLayer,
-      ],
+      ].filter(Boolean),
     })
-  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, pickedVessel, vesselTrack])
+  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, vesselModels, standing, afloat, vesselTrack])
 
   useEffect(() => {
     if (map.current?.getLayer(INLAND_WATER.id)) {
@@ -728,6 +799,8 @@ export default function App() {
             <Toggle checked={show.depare} onChange={shows('depare')}>Depth areas</Toggle>
             <Toggle checked={show.lndare} onChange={shows('lndare')}>Land</Toggle>
             <Toggle checked={show.buildings} onChange={shows('buildings')}>Buildings</Toggle>
+            <Toggle checked={show.objects} onChange={shows('objects')}>Buoys, lights and landmarks</Toggle>
+            {show.objects && zoom < OBJECTS_ZOOM && <p className={note}>Zoom in further to see these</p>}
           </Section>
 
           <Section title="Depth contours" className="gap-2">
@@ -826,7 +899,11 @@ export default function App() {
                   {name}
                 </Toggle>
               ))}
-              {smallestVessel > 0 && <p className={`mt-2 ${note}`}>{smallestVessel} m and longer at this zoom: closer in, smaller ones show.</p>}
+              {heatmap ? (
+                <p className={`mt-2 ${note}`}>Zoomed out this far, they show as a heatmap of traffic: closer in, the vessels themselves.</p>
+              ) : (
+                smallestVessel > 0 && <p className={`mt-2 ${note}`}>{smallestVessel} m and longer at this zoom: closer in, smaller ones show.</p>
+              )}
             </Section>
           )}
           <p className={note}>

@@ -12,10 +12,7 @@ const VESSEL_BIG_TYPES = '?type=60-89'
 const VESSEL_MIN_LENGTH = [[4, 200], [6, 100], [8, 50], [10, 20]] // below this zoom, only vessels this long, in m
 const VESSEL_LENGTH_PX = [7, 16] // true to scale, unless smaller on screen than this, from all the way out to the charts' zooms
 const VESSEL_BEAM = 0.5 // of the above: a ship true to scale would be nothing from far out
-const VESSEL_HEIGHT = 0.35 // of it again
 const VESSEL_SLIM = 6 // length to beam, for a vessel that doesn't report its beam
-const VESSEL_SHOULDER = 0.2 // of its length, ahead of the middle: where the hull starts to narrow to the bow
-const VESSEL_TALL = 0.12 // of its length: AIS gives no height
 const VESSEL_REACH = 12 // px: how near a click counts
 export const VESSEL_DOT = 3 // px, for beacons, shore stations and gear: they have no heading or size to draw
 export const AIDS = 'Aids and stations'
@@ -70,31 +67,21 @@ export function vesselTiles(m) {
   }
 }
 
-// a rough hull, a pentagon with its point at the bow: true length and beam, unless they'd be too small on screen to see
+// where to draw a vessel and how big (models.js draws it): true length and beam, unless too small on screen to see
 export function vesselShape(vessel, zoom, level, middle) {
-  const { lat, hdg = 0 } = vessel
+  const { lat } = vessel
   const lng = vessel.lng + 360 * Math.round((middle - vessel.lng) / 360)
   const metresPerPixel = (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
   const [smallest, largest] = VESSEL_LENGTH_PX
   const least = (smallest + ((largest - smallest) * Math.min(zoom, VESSEL_ALL_ZOOM)) / VESSEL_ALL_ZOOM) * metresPerPixel
   const length = Math.max(vessel.length || 0, least)
-  const beam = Math.max(vessel.beam || (vessel.length || 0) / VESSEL_SLIM, least * VESSEL_BEAM)
-  const east = Math.sin((hdg * Math.PI) / 180)
-  const north = Math.cos((hdg * Math.PI) / 180)
-  const across = 111320 * Math.cos((lat * Math.PI) / 180)
-  const point = (forward, side) => [lng + (forward * east + side * north) / across, lat + (forward * north - side * east) / 111320, level]
   return {
     vessel,
     centre: [lng, lat],
+    level,
+    length,
+    beam: Math.max(vessel.beam || (vessel.length || 0) / VESSEL_SLIM, least * VESSEL_BEAM),
     reach: Math.max(VESSEL_REACH, length / 2 / metresPerPixel),
-    ring: [
-      point(length / 2, 0),
-      point(length * VESSEL_SHOULDER, beam / 2),
-      point(-length / 2, beam / 2),
-      point(-length / 2, -beam / 2),
-      point(length * VESSEL_SHOULDER, -beam / 2),
-    ],
-    height: Math.max(length * VESSEL_TALL, least * VESSEL_HEIGHT),
   }
 }
 

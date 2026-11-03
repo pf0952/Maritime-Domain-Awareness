@@ -308,6 +308,14 @@ def chart_file(chart: Chart, tier: int, catalog: Catalog) -> Path:
     return CACHE / f"{chart.name}-{key}.gz"
 
 
+def objects_file(chart: Chart, tier: int, catalog: Catalog) -> Path:
+    """A chart's objects, worked out when first asked for. In a folder of their own, as tidying the cache keeps only
+    the files it compiles itself.
+
+    ponytail: old versions pile up here, a few kB each; prune them like the charts if that ever matters"""
+    return CACHE / "objects" / f"{chart_file(chart, tier, catalog).stem}-{charts.OBJECT_FORMAT}.gz"
+
+
 def cut_out(chart: Chart, tier: int, catalog: Catalog) -> bytes | None:
     """What finer charts take from this one at that tier."""
     finer = catalog.finer(chart, tier)

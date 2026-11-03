@@ -417,6 +417,103 @@ def compile_cell(path: Path, hole: shapely.Geometry | None = None) -> bytes:
     return pack(name, scale, bounds, meshes, centred=max(bounds[2] - bounds[0], bounds[3] - bounds[1]) <= WIDE)
 
 
+OBJECT_FORMAT = 1  # the same, for a chart's objects
+# what the viewer draws a model of, by object class; areas stand at a point in the middle, with their size
+OBJECT_LAYERS = {
+    **dict.fromkeys(("BOYLAT", "BOYCAR", "BOYISD", "BOYSAW", "BOYSPP", "BOYINB"), "buoy"),
+    **dict.fromkeys(("BCNLAT", "BCNCAR", "BCNISD", "BCNSAW", "BCNSPP"), "beacon"),
+    "TOPMAR": "topmark", "LIGHTS": "light", "LNDMRK": "landmark", "LITVES": "lightship", "LITFLT": "lightfloat",
+    "WRECKS": "wreck", "UWTROC": "rock", "OBSTRN": "obstruction", "MORFAC": "mooring", "PILPNT": "pile",
+    "OFSPLF": "platform", "SILTNK": "tank", "CRANES": "crane",
+}
+SHAPE_FIELDS = {"buoy": "BOYSHP", "beacon": "BCNSHP", "topmark": "TOPSHP", "landmark": "CATLMK", "wreck": "CATWRK",
+                "mooring": "CATMOR", "tank": "CATSIL"}
+SLAB_LAYERS = {"BRIDGE": ("bridge", 8), "PONTON": ("pontoon", 3), "FLODOC": ("pontoon", 3)}  # m wide, when a line
+OBJECT_NUMBERS = ("HEIGHT", "VERCLR", "VALSOU", "WATLEV", "COLPAT")
+OBJECT_GROUND = 10  # m deep, for something in the water where the chart gives no depth band
+
+
+def numbers(value) -> list:
+    """An S-57 list, such as colours, as whole numbers: it can come as an array, text or one number."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return []
+    items = value.split(",") if isinstance(value, str) else np.atleast_1d(value)
+    return [int(float(v)) for v in items if str(v).strip() not in ("", "nan")]
+
+
+def widen(lines: np.ndarray, metres: float) -> np.ndarray:
+    """Lines as strips that wide, measured on the ground: degrees of longitude shrink away from the equator."""
+    squash = np.cos(np.radians(shapely.get_coordinates(lines)[:, 1].mean()))
+    flat = shapely.transform(lines, lambda xy: xy * [squash, 1])
+    return shapely.transform(shapely.buffer(flat, metres / 2 / 111_320, cap_style="flat"), lambda xy: xy / [squash, 1])
+
+
+def chart_objects(path: Path, hole: shapely.Geometry | None = None) -> list:
+    """A cell's buoys, beacons, lights, landmarks, hazards and structures, for the viewer to draw models of. Each has
+    the ground it stands on: the land's top, or the deep end of the depth band it's in."""
+    layers = set(pyogrio.list_layers(path)[:, 0])
+    if hole is not None:
+        shapely.prepare(hole)
+    land = polygons(path, "LNDARE").geometry.to_numpy()
+    water = pd.concat([polygons(path, "DEPARE", ("DRVAL1", "DRVAL2")), polygons(path, "DRGARE", ("DRVAL1", "DRVAL2"))])
+    found = []
+    for layer in layers & (OBJECT_LAYERS.keys() | SLAB_LAYERS.keys()):
+        rows = pyogrio.read_dataframe(path, layer=layer)
+        shapes = rows.geometry.to_numpy()
+        keep = ~shapely.is_empty(shapes) & ~shapely.is_missing(shapes)
+        if hole is not None:
+            keep &= ~shapely.contains(hole, shapely.point_on_surface(shapes))
+        rows, shapes = rows[keep], shapes[keep]
+        if layer in SLAB_LAYERS:
+            kind, width = SLAB_LAYERS[layer]
+            lines = shapely.get_type_id(shapes) == shapely.GeometryType.LINESTRING
+            if lines.any():
+                shapes[lines] = widen(shapes[lines], width)
+            clearances = rows["VERCLR"] if "VERCLR" in rows else pd.Series(np.nan, index=rows.index)
+            for shape, clearance in zip(shapes, clearances):
+                # (outer rings anticlockwise and holes clockwise, so the viewer can tell which way their sides face)
+                for part in shapely.orient_polygons(only_polygons(np.array([shape]))):
+                    xy, triangles = earcut(part)
+                    found.append({
+                        "kind": kind,
+                        "xy": xy.round(7).ravel().tolist(),
+                        "triangles": triangles.tolist(),
+                        "rings": [len(shapely.get_coordinates(r)) - 1 for r in shapely.get_rings(part)],
+                        "clearance": None if np.isnan(clearance) else float(clearance),
+                    })
+            continue
+        kind = OBJECT_LAYERS[layer]
+        points = shapely.point_on_surface(shapes)
+        size = np.sqrt(shapely.area(shapes)) * 111_320  # m, about: 0 for a point
+        for point, across, row in zip(points, size, rows.to_dict("records")):
+            thing = {"kind": kind, "at": [round(point.x, 7), round(point.y, 7)], "colours": numbers(row.get("COLOUR"))}
+            if kind in SHAPE_FIELDS:
+                thing["shape"] = (numbers(row.get(SHAPE_FIELDS[kind])) or [0])[0]
+            for field in OBJECT_NUMBERS:
+                value = row.get(field)
+                if isinstance(value, (int, float)) and not np.isnan(value):
+                    thing[field.lower()] = float(value)
+            if across:
+                thing["size"] = round(float(across), 1)
+            found.append(thing)
+    points = [shapely.Point(thing["at"]) for thing in found if "at" in thing]
+    ground = np.full(len(points), -float(OBJECT_GROUND))
+    if len(points) and len(water):
+        deep = water["DRVAL2"].fillna(water["DRVAL1"]).fillna(OBJECT_GROUND).to_numpy(dtype=float)
+        which, area = shapely.STRtree(water.geometry.to_numpy()).query(points, predicate="intersects")
+        ground[which] = -deep[area]
+    if len(points) and len(land):
+        ground[np.unique(shapely.STRtree(land).query(points, predicate="intersects")[0])] = LAND_HEIGHT
+    for thing, height in zip((t for t in found if "at" in t), ground):
+        thing["ground"] = float(height)
+    return found
+
+
+def compile_objects(path: Path, hole_wkb: bytes | None, out: Path) -> None:
+    found = chart_objects(path, shapely.from_wkb(hole_wkb) if hole_wkb else None)
+    save(json.dumps(found, separators=(",", ":")).encode(), out)
+
+
 def save(data: bytes, out: Path) -> None:
     """Writes to the cache. The whole file appears at once, or none of it."""
     out.parent.mkdir(exist_ok=True)

@@ -223,6 +223,28 @@ function chartLayers(chart, show, zoom, level, contours, sun) {
   ]
 }
 
+// models of chart objects or vessels (models.js), drawn just as the charts are, so the tide and the night reach them
+const NO_CONTOURS = { contours: 0, shallow: 0, safety: 0, deep: 0 }
+export function modelLayer(id, { mesh, origin }, level, sun, beforeId) {
+  return (
+    mesh &&
+    new Mesh({
+      id,
+      beforeId,
+      data: ONE,
+      mesh,
+      topology: 'triangle-list',
+      level,
+      contours: NO_CONTOURS,
+      sun,
+      seabed: false,
+      behind: 0,
+      coordinateSystem: COORDINATE_SYSTEM.LNGLAT_OFFSETS,
+      coordinateOrigin: [...origin, 0],
+    })
+  )
+}
+
 // one layer to MapLibre, however many charts are showing
 export class Charts extends CompositeLayer {
   renderLayers() {

@@ -210,8 +210,23 @@ def get_chart(name: str, tier: int):
     return chart_response(path)
 
 
-def chart_response(path: Path) -> FileResponse:
-    return FileResponse(path, media_type="application/octet-stream", headers={
+@app.get("/api/objects/{name}/{tier}")
+def get_objects(name: str, tier: int):
+    """A chart's buoys, beacons, landmarks and the like, less what finer charts show."""
+    chart = sync.catalog.by_name.get(name)
+    if chart is None or name not in sync.on_disk:
+        raise HTTPException(404, f"No chart {name}")
+    path = sync.objects_file(chart, tier, sync.catalog)
+    if not path.exists():
+        try:
+            charts.compile_objects(sync.cell_path(chart), sync.cut_out(chart, tier, sync.catalog), path)
+        except UNREADABLE:
+            raise HTTPException(503, f"{name} can't be read just now")
+    return chart_response(path, "application/json")
+
+
+def chart_response(path: Path, media_type: str = "application/octet-stream") -> FileResponse:
+    return FileResponse(path, media_type=media_type, headers={
         "Content-Encoding": "gzip",
         "Cache-Control": "public, max-age=31536000, immutable",  # the viewer's URLs carry the key
     })

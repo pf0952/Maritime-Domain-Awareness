@@ -104,6 +104,15 @@ surface = charts.Surface(np.empty((0, 2)), np.empty(0), [0, 0, 1, 1])  # and an 
 surface.steer(middle, np.zeros(1), np.full(1, 5.0))
 assert 2 < surface.depth_at(middle)[0] < 3
 
+# Boston harbour's buoys float over water, its landmarks stand on land, and finer charts take what they cover
+things = charts.chart_objects(harbour)
+kinds = {t["kind"] for t in things}
+assert {"buoy", "light", "landmark"} <= kinds, kinds
+assert all(t["ground"] < charts.LAND_HEIGHT for t in things if t["kind"] == "buoy")
+assert any(t["ground"] == charts.LAND_HEIGHT for t in things if t["kind"] == "landmark")
+assert json.loads(json.dumps(things)) == things, "objects must be plain JSON, with no NaN"
+assert not charts.chart_objects(harbour, shapely.box(-180, -90, 180, 90))
+
 assert upload("notes.txt", cell).status_code == 415
 assert upload("junk.000", b"not a chart").status_code == 422
 main.MAX_BYTES = 10
