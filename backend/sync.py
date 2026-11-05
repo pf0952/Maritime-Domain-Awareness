@@ -475,6 +475,31 @@ def wanted_tile(file: Path) -> bool:
         return False
 
 
+def run_jobs(jobs: list, finished) -> None:
+    """Each (function, *args) on all the CPUs but one, telling finished each one's exception, or None.
+
+    A worker can die as it starts, with WinError 6 and no fault of the job's, and it takes the pool with it. Whatever
+    that loses goes round again in a new pool, and if they keep dying, one at a time here, which is slower but sure."""
+    for _ in range(POOLS):
+        if not jobs:
+            break
+        lost = []
+        with ProcessPoolExecutor(WORKERS) as pool:
+            running = {pool.submit(*job): job for job in jobs}
+            for future in as_completed(running):
+                if isinstance(future.exception(), BrokenProcessPool):
+                    lost.append(running[future])
+                else:
+                    finished(future.exception())
+        jobs = lost
+    for function, *args in jobs:
+        try:
+            function(*args)
+            finished(None)
+        except Exception as e:  # one bad job mustn't stop the rest
+            finished(e)
+
+
 def compile_all() -> None:
     files = all_files(catalog)
     todo = [(file, *job) for file, job in files.items() if not file.exists()]
@@ -495,26 +520,7 @@ def compile_all() -> None:
         if problem:
             failed, error = failed + 1, problem
 
-    # A worker can die as it starts, with WinError 6 and no fault of the job's, and it takes the pool with it. Whatever
-    # that loses goes round again in a new pool, and if they keep dying, one at a time here, which is slower but sure.
-    for _ in range(POOLS):
-        if not jobs:
-            break
-        lost = []
-        with ProcessPoolExecutor(WORKERS) as pool:
-            running = {pool.submit(*job): job for job in jobs}
-            for future in as_completed(running):
-                if isinstance(future.exception(), BrokenProcessPool):
-                    lost.append(running[future])
-                else:
-                    finished(future.exception())
-        jobs = lost
-    for function, *args in jobs:
-        try:
-            function(*args)
-            finished(None)
-        except Exception as e:  # one bad chart mustn't stop the rest
-            finished(e)
+    run_jobs(jobs, finished)
     if failed:  # each shows up as a gap, and the viewer compiles it when asked, or says it can't
         status["problem"] = f"{failed} of {status['total']} charts didn't compile: {error!r}"
     if catalog.charts:  # (with no catalog to go by, everything would look old)

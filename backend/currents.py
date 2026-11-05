@@ -92,7 +92,11 @@ def in_view(west: float, south: float, east: float, north: float) -> dict:
     """The stations in an area, nearest its middle first, each with its current every hour across the tide bar."""
     lat, lng = (south + north) / 2, (west + east) / 2
     here = [s for s in stations() if south <= s["lat"] <= north and west <= s["lng"] <= east]
-    here = sorted(here, key=lambda s: tides.distance(lat, lng, s))[:MOST]
+    # one to a spot: NOAA lists some places once for each depth it predicts there, which would draw arrows on arrows
+    spots = {}
+    for s in here:
+        spots.setdefault((round(s["lat"], 4), round(s["lng"], 4)), s)
+    here = sorted(spots.values(), key=lambda s: tides.distance(lat, lng, s))[:MOST]
     now = time.time()
     found = pool.map(lambda s: series(s, now), here)
     return {

@@ -2,15 +2,14 @@
 
 Run start.bat, or from the project folder:
 backend/.venv/Scripts/python -m uvicorn main:app --app-dir backend
-It also serves the built viewer (frontend/dist), so that's the whole app, at http://127.0.0.1:8000"""
+It also serves the built viewer (frontend/dist), so that's the whole app, at http://127.0.0.1:8000. start.bat runs it
+through launch.py instead, which finds a free port and opens it in a window of its own."""
 import json
-import os
 import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
-import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,9 +21,11 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pyogrio.errors import DataLayerError, DataSourceError
 
+import archives
 import berths
 import charts
 import currents
+import fleet
 import navwarnings
 import route
 import sync
@@ -42,8 +43,7 @@ search_turn = threading.Lock()
 async def lifespan(app: FastAPI):
     threading.Thread(target=sync.run, daemon=True).start()
     threading.Thread(target=navwarnings.run, daemon=True).start()
-    if os.environ.get("ENC_OPEN_BROWSER"):  # (start.bat)
-        threading.Timer(1, webbrowser.open, ["http://127.0.0.1:8000"]).start()
+    threading.Thread(target=fleet.run, daemon=True).start()
     yield
 
 
@@ -59,6 +59,21 @@ def same_site(origin: str | None = Header(None), host: str | None = Header(None)
     """Any web page open in the browser can send to this address, so only our own may change what's stored."""
     if origin and urllib.parse.urlparse(origin).netloc != host:
         raise HTTPException(403, "Only the viewer itself can change uploads")
+
+
+# when the viewer's windows last said they were open, and when one last said it was closing: launch.py stops the
+# server once none is left
+windows = {"alive": None, "bye": None}
+
+
+@app.post("/api/alive", dependencies=[Depends(same_site)])
+def post_alive():
+    windows["alive"] = time.time()
+
+
+@app.post("/api/bye", dependencies=[Depends(same_site)])
+def post_bye():
+    windows["bye"] = time.time()
 
 
 @app.get("/api/uploads")
@@ -197,6 +212,64 @@ def post_berths(vessels: list[dict] = Body(..., max_length=500)):
         return berths.adjust([v for v in clean if 0 < v["length"] < 500 and 0 < v["beam"] < 100])
     except (OSError, ValueError, UNREADABLE) as e:
         raise HTTPException(503, f"No berths just now: {e}")
+
+
+@app.get("/api/fleets")
+def get_fleets():
+    return fleet.fleets()
+
+
+@app.put("/api/fleets/{name}", dependencies=[Depends(same_site)])
+def put_fleet(name: str, mmsis: list[int] = Body(..., max_length=fleet.MOST)):
+    """Saves a fleet, up to fleet.MOST vessels by MMSI, and starts recording any that are new."""
+    if not name.strip() or len(name) > 80:
+        raise HTTPException(422, "A fleet needs a name, of 80 characters at most")
+    fleet.save_fleet(name.strip(), [m for m in dict.fromkeys(mmsis) if 0 < m < 1_000_000_000])
+    if archives.settings().get("gfw_token"):
+        archives.start("gfw")  # (port visits for any new vessels; skipped if a run's going)
+    return fleet.fleets()
+
+
+@app.delete("/api/fleets/{name}", dependencies=[Depends(same_site)])
+def delete_fleet(name: str):
+    fleet.delete_fleet(name)
+    return fleet.fleets()
+
+
+@app.get("/api/fleet/sources")
+def get_fleet_sources():
+    """Whether a Global Fishing Watch token is set (never the token itself), and how each history run is going."""
+    return archives.state()
+
+
+@app.put("/api/fleet/gfw-token", dependencies=[Depends(same_site)])
+def put_gfw_token(token: str = Body(..., embed=True, max_length=4000)):
+    archives.set_gfw_token(token)
+    if token.strip():
+        archives.start("gfw")
+    return archives.state()
+
+
+@app.post("/api/fleet/backfill/{source}", dependencies=[Depends(same_site)])
+def post_backfill(source: str, years: int = Query(1, ge=1, le=5)):
+    """Starts filling in history from a free source: gfw (port visits), us (MarineCadastre) or dk (Danish)."""
+    if source not in ("gfw", "us", "dk"):
+        raise HTTPException(404, f"No source {source}")
+    if not archives.start(source, years):
+        raise HTTPException(409, "One's running already: stop it first, or let it finish")
+    return archives.state()
+
+
+@app.post("/api/fleet/backfill-stop", dependencies=[Depends(same_site)])
+def post_backfill_stop():
+    archives.stop.set()
+    return archives.state()
+
+
+@app.get("/api/fleet/vessel/{mmsi}")
+def get_fleet_vessel(mmsi: int):
+    """One vessel's recorded history, worked out: port calls, voyages, loads and discharges, gaps."""
+    return fleet.analyse(mmsi)
 
 
 @app.get("/api/route")

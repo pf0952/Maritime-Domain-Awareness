@@ -1,6 +1,6 @@
 @echo off
 rem ENC 3D. The first run sets everything up (it needs Python and Node), then the app fetches NOAA's charts itself.
-rem Leave this window open while you use the app, and close it to stop.
+rem Close the app's window and it stops.
 cd /d "%~dp0"
 if not exist backend\.venv\Scripts\python.exe (
   echo Setting up Python...
@@ -15,7 +15,9 @@ if not exist frontend\dist\index.html (
   call npm run build || goto failed
   popd
 )
-set ENC_OPEN_BROWSER=1
-backend\.venv\Scripts\python -m uvicorn main:app --app-dir backend %*
+rem opens it in a window of its own, starting the server first on a free port if it isn't running already. The server
+rem runs with no console (its messages go to enc\server.log), and stops once the last window is closed
+start "" backend\.venv\Scripts\pythonw.exe backend\launch.py %*
+exit /b 0
 :failed
 pause

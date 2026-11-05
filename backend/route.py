@@ -78,6 +78,7 @@ def ports() -> tuple:
               "lng": f["geometry"]["coordinates"][0], "lat": f["geometry"]["coordinates"][1]} for f in features]
     by_code, by_name = {p["code"]: p for p in ports}, {p["name"].upper(): p for p in ports}
     for p in un_ports():
+        p = {**p, "un": True}  # (a few of its positions are wrong: searoute's are checked)
         by_code.setdefault(p["code"], p)
         by_name.setdefault(p["name"].upper(), p)
     return by_code, by_name

@@ -82,7 +82,7 @@ const country = (code) => {
 }
 
 // a vessel as search lists it: its flag, name, then what it is and how big
-function VesselFound({ vessel }) {
+export function VesselFound({ vessel }) {
   const flag = /^[A-Z]{2}$/.test(vessel.flag ?? '') ? vessel.flag : null
   const kind = OFFSHORE_NAMES[offshoreKind(vessel)] ?? vesselCategory(vessel)
   const size = vessel.length ? `${vessel.length}${vessel.beam ? ` × ${vessel.beam}` : ''} m` : null
@@ -138,7 +138,7 @@ export function SearchBar({ go }) {
     <form
       role="search"
       onSubmit={search}
-      className="absolute top-3 right-4 left-22 z-10 text-sm text-slate-100 md:right-auto md:left-1/2 md:w-[26rem] md:-translate-x-1/2"
+      className="absolute top-3 right-36 left-22 z-10 text-sm text-slate-100 md:right-auto md:left-1/2 md:w-[26rem] md:-translate-x-1/2"
     >
       <input
         type="search"
@@ -233,7 +233,7 @@ export function VesselCard({ vessel, detail, route, close }) {
   return (
     <section
       aria-label={`Vessel ${vessel.name ?? vessel.mmsi}`}
-      className="absolute top-4 right-4 flex max-h-[60%] w-80 max-w-[calc(100%-2rem)] flex-col gap-2 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 [scrollbar-color:#475569_transparent] [scrollbar-width:thin] p-4 text-sm text-slate-100 shadow-xl"
+      className="absolute top-16 right-4 flex max-h-[60%] w-80 max-w-[calc(100%-2rem)] flex-col gap-2 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 [scrollbar-color:#475569_transparent] [scrollbar-width:thin] p-4 text-sm text-slate-100 shadow-xl"
     >
       <header className="flex items-start justify-between gap-2">
         <div>

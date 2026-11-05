@@ -1,4 +1,4 @@
-import { PathLayer, PolygonLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers'
+﻿import { PathLayer, PolygonLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers'
 import { CURRENTS_ZOOM, OBJECTS_ZOOM, currentArrows, objectMeshes, vesselMesh } from './models'
 import { CRESTS, WIND_RGB, WeatherCanvas, directionAt, indexWeather, unpackLand, weatherAt } from './weather'
 import { MapboxOverlay } from '@deck.gl/mapbox'
@@ -12,11 +12,16 @@ import { AIDS, AIS, PLEASURE, VESSEL_CATEGORIES, VESSEL_DOT, VESSEL_FOUND_ZOOM, 
 import { ROMAN, WARNING_AGES, WARNING_CATEGORIES, WARNING_DOT, WARNING_DOT_PICKED, WARNING_EDGE, WARNING_FILL, WARNING_FILL_PICKED, cutFeeds, warningShapes, warningsAt } from './warnings'
 import { Charts, modelLayer, unpack } from './meshes'
 import { ICONS, Section, SideMenu, Toggle } from './menu'
+import { FleetView } from './fleet'
 import { LoadingScreen, SearchBar, TIDE_HOURS, TidePanel, VesselCard, syncMessage } from './panels'
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
 const OCEAN = '#081e42'
 const TIER_ZOOMS = [8.5, 11, 13, 15] // the zoom each finer band of charts comes in at
+const CHARTS_KEPT = 160 // charts held, hidden, beyond those showing: memory, but nothing to draw
+const VIEW_MARGIN = 0.25 // of the view's size, fetched round it
+const GLOBE_ZOOM = 5 // further out, the earth's a globe
+const GLOBE_LAND = 'rgb(47, 53, 64)' // backend/charts.py's LAND_RGB
 const CHARTS_ZOOM = 4 // further out than this, there's just the world's land: charts would be specks
 const POLL = 5000 // ms
 const TIDE_REFRESH = 600000 // ms
@@ -45,6 +50,8 @@ const WARNINGS_RETRY = 15000 // ms: while the first ever look through the feeds 
 const GREY_AFTER = 250 // ms of loading before the screen greys, or every small pan would flash
 const UNGREY_AFTER = 150 // ms of quiet before it clears, as one thing's end can come just before the next one's start
 const LIGHT_DOT = 3 // px
+const ALIVE_EVERY = 10000 // ms: how often a window tells the server it's open (backend/launch.py)
+const TRACK_GAP = 12 * 3600 // s: reports further apart than this aren't joined up on the map
 const BERTH_ZOOM = 15 // closer than this, vessels are drawn about true to size, and alongside quays they're set clear of them
 const STOPPED = 0.5 // knots
 const CURRENT_LABELS_ZOOM = 12 // further out, the arrows go without their speeds
@@ -147,6 +154,7 @@ function skylineTiles(m, detailed) {
 }
 
 const tierAt = (zoom) => (zoom < CHARTS_ZOOM ? 0 : 2 + TIER_ZOOMS.filter((z) => zoom >= z).length)
+const tierStart = (tier) => (tier === 0 ? 0 : tier === 2 ? CHARTS_ZOOM : TIER_ZOOMS[tier - 3]) // the zoom it comes in at
 
 
 export default function App() {
@@ -157,7 +165,10 @@ export default function App() {
   const cube = useRef(null)
   const overview = useRef(null)
   const footprint = useRef(null)
-  const [shown, setShown] = useState([]) // the charts in view
+  const [kept, setKept] = useState([]) // every chart loaded, showing or not
+  const [showing, setShowing] = useState(new Set()) // keys of the ones showing
+  const [standby, setStandby] = useState(new Set()) // and of those fetched ahead, for the levels of detail either side
+  const shown = useMemo(() => kept.filter((chart) => showing.has(chart.id)), [kept, showing]) // the charts in view
   const [objects, setObjects] = useState([]) // their buoys, landmarks and the like, when close enough in: { id, things }
   const [charts, setCharts] = useState([]) // the ones uploaded
   const [loading, setLoading] = useState(false)
@@ -167,6 +178,7 @@ export default function App() {
   const [sync, setSync] = useState(null)
   const [ready, setReady] = useState(false)
   const [zoom, setZoom] = useState(0)
+  const [globe, setGlobe] = useState(false) // zoomed out far enough for the map's own globe, and none of our meshes
   const [show, setShow] = useState({
     depare: true,
     lndare: true,
@@ -188,6 +200,8 @@ export default function App() {
   const [charted, setCharted] = useState(true) // is any ENC in view?
   const [detailed, setDetailed] = useState(true) // is any in view fine enough to stand buildings on?
   const [tide, setTide] = useState(null)
+  const [tab, setTab] = useState('map') // the map, or the Fleet tab over it
+  const [fleetTrack, setFleetTrack] = useState(null) // a fleet vessel's track to show on the map: { name, path }
   const [view, setView] = useState(null) // the map's bounds, as of the last move
   const [currents, setCurrents] = useState([]) // NOAA's current stations in view
   const [weather, setWeather] = useState(null) // wind and waves on a grid over the view
@@ -278,10 +292,18 @@ export default function App() {
     })
     // ponytail: deck.gl 9.4 still reads map.transform, which MapLibre 6 moved to the camera; drop once deck.gl catches up
     Object.defineProperty(m, 'transform', { get: () => m._camera.transform })
+    // and deck.gl knows a globe or a flat map, not the blend between: it takes whichever the map is nearer to
+    m.getProjection = () => ({ type: m.getZoom() < GLOBE_ZOOM - 0.5 ? 'globe' : 'mercator' })
     const layers = (style) => {
       const kept = style.layers
-        .filter((l) => !HEAVY_BASEMAP.test(l.id))
-        .map((l) => (l.type === 'background' ? { ...l, paint: { 'background-color': OCEAN } } : l))
+        .filter((l) => !HEAVY_BASEMAP.test(l.id) || l.id === 'water')
+        .map((l) => {
+          // on the globe, the map's own land and sea: big flat triangles, as the charts' and the world's land are
+          // made of, would cut through the sphere as chords and lie under it
+          if (l.type === 'background') return { ...l, paint: { 'background-color': ['step', ['zoom'], GLOBE_LAND, GLOBE_ZOOM, OCEAN] } }
+          if (l.id === 'water') return { ...l, maxzoom: GLOBE_ZOOM, paint: { 'fill-color': OCEAN } }
+          return l
+        })
       kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, INLAND_WATER, SKYLINE, BUILDINGS, TRAFFIC)
       return kept
     }
@@ -289,6 +311,8 @@ export default function App() {
       transformStyle: (_, style) => ({
         ...style,
         sources: { ...style.sources, skyline: { type: 'geojson', data: EMPTY }, traffic: { type: 'geojson', data: trafficNow.current } },
+        // zoomed out, the earth as a globe, flattening to the charts' Mercator over the zoom before GLOBE_ZOOM
+        projection: { type: ['interpolate', ['linear'], ['zoom'], GLOBE_ZOOM - 1, 'vertical-perspective', GLOBE_ZOOM, 'mercator'] },
         layers: layers(style),
       }),
     })
@@ -301,7 +325,10 @@ export default function App() {
     m.addControl(overlay.current)
     map.current = m
 
-    const have = new Map() // key: chart
+    const have = new Map() // key: chart, the most lately used last
+    const tiers = new Map() // tier: the charts it needs and the area they're for, as last fetched
+    let showing = new Set() // keys of the charts showing
+    let shownTier = null
     const haveObjects = new Map() // key: its objects
     let request = null
 
@@ -442,17 +469,59 @@ export default function App() {
     }
     const vesselTimer = setInterval(() => loadVessels.current(true), VESSEL_REFRESH)
 
+    // Charts stack up rather than come and go: those seen lately are kept, hidden, ready to show again at once, and the
+    // levels of detail either side of this one are fetched ahead, so zooming across one switches without a wait
+    const stacked = () => setKept([...have.values()])
+    const showOnly = (keys) => {
+      showing = new Set(keys)
+      setShowing(showing)
+    }
+    const use = (key) => {
+      const chart = have.get(key)
+      have.delete(key) // (to the end of the line: the most lately used are kept longest)
+      have.set(key, chart)
+    }
+    const evict = () => {
+      for (const key of have.keys()) {
+        if (have.size <= CHARTS_KEPT) break
+        if (!showing.has(key)) have.delete(key)
+      }
+    }
+    // the charts a tier needs for an area, and as many of them as can be fetched
+    async function fetchTier(tier, bounds, zoom, signal) {
+      const [west, south, east, north] = bounds
+      const corners = [west, north, east, north, east, south, west, south]
+      const query = new URLSearchParams({ west, south, east, north, tier, zoom, corners })
+      const answer = await (await fetch(`/api/view?${query}`, { signal })).json()
+      await Promise.all(
+        answer.pieces
+          .filter((c) => !have.has(c.key))
+          .map(async (c) => {
+            const res = await fetch(`/api/chart/${c.name}/${c.tier}?key=${c.key}`, { signal })
+            if (res.ok) have.set(c.key, { id: c.key, ...unpack(await res.arrayBuffer()) }) // (mid-update, say: asked again)
+          }),
+      )
+      answer.pieces.forEach((c) => have.has(c.key) && use(c.key))
+      tiers.set(tier, { bounds, want: answer.pieces })
+      return answer
+    }
+
     refresh.current = async () => {
       request?.abort()
       request = new AbortController()
       const { signal } = request
       const [[west, south], [east, north]] = m.getBounds().toArray()
-      setZoom(m.getZoom())
+      const zoom = m.getZoom()
+      setZoom(zoom)
       setView({ west, south, east, north })
       const { clientWidth: width, clientHeight: height } = m.getCanvas()
       const corners = [[0, 0], [width, 0], [width, height], [0, height]].flatMap((p) => m.unproject(p).toArray())
-      const tier = tierAt(m.getZoom())
-      const query = new URLSearchParams({ west, south, east, north, tier, zoom: m.getZoom(), corners })
+      const tier = tierAt(zoom)
+      shownTier = tier
+      // a margin round the view, so a pan doesn't open up gaps at its edge
+      const [padX, padY] = [(east - west) * VIEW_MARGIN, (north - south) * VIEW_MARGIN]
+      const area = [west - padX, Math.max(south - padY, -85), east + padX, Math.min(north + padY, 85)]
+      const query = new URLSearchParams({ west: area[0], south: area[1], east: area[2], north: area[3], tier, zoom, corners })
       loadTide()
       try {
         const { charted: noaa, detailed: fine, pieces: want } = await (await fetch(`/api/view?${query}`, { signal })).json()
@@ -460,25 +529,59 @@ export default function App() {
         setDetailed(fine.length > 0)
         loadSkyline(fine)
         const missing = want.filter((c) => !have.has(c.key))
-        setLoading(missing.length > 0)
+        // grey only with nothing at all to show meanwhile: what's showing stays till this view has all arrived
+        setLoading(missing.length > 0 && showing.size === 0)
         await Promise.all(
           missing.map(async (c) => {
             const res = await fetch(`/api/chart/${c.name}/${c.tier}?key=${c.key}`, { signal })
             if (!res.ok) return // mid-update, say: the next refresh asks again
             have.set(c.key, { id: c.key, ...unpack(await res.arrayBuffer()) })
-            setShown([...have.values()])
+            stacked()
+            showOnly([...showing, c.key])
           }),
         )
-        // what's showing stays until all of this view has arrived, so nothing blinks out in between
-        const keys = new Set(want.map((c) => c.key))
-        for (const key of have.keys()) if (!keys.has(key)) have.delete(key)
-        setShown(want.filter((c) => have.has(c.key)).map((c) => have.get(c.key)))
-        await loadObjects(want, signal)
+        want.forEach((c) => have.has(c.key) && use(c.key))
+        tiers.set(tier, { bounds: area, want })
+        showOnly(want.filter((c) => have.has(c.key)).map((c) => c.key))
+        evict()
+        stacked()
         setLoading(false)
+        await loadObjects(want, signal)
+        // then, hidden, the levels either side: finer for the view as it is, coarser for the wider view zooming out
+        const finer = tier === 0 ? 2 : tier + 1
+        const coarser = tier === 2 ? 0 : tier - 1
+        if (finer <= 6) await fetchTier(finer, area, tierStart(finer), signal)
+        if (coarser >= 0) {
+          const wider = 2 ** Math.min(Math.max(zoom - (tierStart(tier) - 0.5), 0.5), 1.5) // (one zoom out, about: further, it waits)
+          const [midX, midY] = [(west + east) / 2, (south + north) / 2]
+          const [halfX, halfY] = [((east - west) / 2) * wider * (1 + VIEW_MARGIN), ((north - south) / 2) * wider * (1 + VIEW_MARGIN)]
+          await fetchTier(coarser, [midX - halfX, Math.max(midY - halfY, -85), midX + halfX, Math.min(midY + halfY, 85)], tierStart(tier) - 0.5, signal)
+        }
+        evict()
+        stacked()
+        setStandby(new Set([finer, coarser].flatMap((t) => tiers.get(t)?.want ?? []).map((c) => c.key).filter((key) => have.has(key))))
       } catch (e) {
         if (e.name !== 'AbortError') setLoading(false) // (a newer refresh has taken over otherwise)
       }
     }
+
+    // mid-zoom, the moment the level of detail changes, show the one fetched ahead if it covers the view
+    let zooming = null
+    m.on('zoom', () => {
+      if (zooming) return
+      zooming = requestAnimationFrame(() => {
+        zooming = null
+        setGlobe(m.getZoom() < GLOBE_ZOOM)
+        const tier = tierAt(m.getZoom())
+        const ahead = tiers.get(tier)
+        if (tier === shownTier || !ahead) return
+        const [[west, south], [east, north]] = m.getBounds().toArray()
+        const [w, s, e, n] = ahead.bounds
+        if (west < w || south < s || east > e || north > n || !ahead.want.every((c) => have.has(c.key))) return
+        shownTier = tier
+        showOnly(ahead.want.map((c) => c.key))
+      })
+    })
 
     // buildings are the map's own, so they can't be lit per point: they take the light at the middle of the view
     lightBuildings.current = () => {
@@ -553,11 +656,41 @@ export default function App() {
     map.current.fitBounds([[w, s], [e, n]], { ...camera, maxZoom: SEARCH_ZOOM, padding: 60, animate: false })
   }
 
+  function showFleetTrack(track) {
+    // in pieces where reports were far apart: a straight line across the gap would cross whatever lay between
+    const pieces = [[]]
+    track.path.forEach((point, i) => {
+      if (i && point[2] - track.path[i - 1][2] > TRACK_GAP) pieces.push([])
+      pieces.at(-1).push(point)
+    })
+    setFleetTrack({ ...track, pieces: pieces.filter((piece) => piece.length > 1) })
+    setTab('map')
+    // to where it's been lately: a year of a tanker's trading is the whole world
+    const latest = pieces.filter((piece) => piece.length > 1).at(-1) ?? track.path
+    const lngs = latest.map(([lng]) => lng)
+    const lats = latest.map(([, lat]) => lat)
+    map.current.fitBounds([[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]], { padding: 80, maxZoom: 12, animate: false })
+  }
+
   function overviewClicked(e) {
     const svg = overview.current
     const { x, y } = new DOMPoint(e.clientX, e.clientY).matrixTransform(svg.getScreenCTM().inverse())
     map.current.jumpTo({ center: fromOutline(x, y) })
   }
+
+  // tells the server this window's open, and that it's closing: started from the desktop, the server stops once the
+  // last window is closed (backend/launch.py)
+  useEffect(() => {
+    const alive = () => fetch('/api/alive', { method: 'POST', keepalive: true }).catch(() => {})
+    const bye = () => navigator.sendBeacon('/api/bye')
+    alive()
+    const timer = setInterval(alive, ALIVE_EVERY)
+    window.addEventListener('pagehide', bye)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener('pagehide', bye)
+    }
+  }, [])
 
   // a chart has been updated
   useEffect(() => {
@@ -806,7 +939,7 @@ export default function App() {
   }, [pickedVessel, vesselDetail])
 
   useEffect(() => {
-    const data = shown
+    const data = kept
     const contours = { contours: contourMode, shallow, safety, deep }
     const sun = { sunLat, sunLon, lit }
     const { boxes, dots } = warningShapes(warningsDrawn, zoom)
@@ -816,7 +949,7 @@ export default function App() {
       id: 'warning-boxes',
       beforeId: SKYLINE.id,
       data: boxes,
-      visible: boxes.length > 0,
+      visible: boxes.length > 0 && !globe, // (on the globe, the dots alone: big boxes would sink into it too)
       extruded: true,
       wireframe: true,
       material: false,
@@ -846,7 +979,28 @@ export default function App() {
     })
     vesselsOnMap.current = vesselShapes
     const vesselLayer = modelLayer('vessels', vesselModels, level, sun, SKYLINE.id)
-    const currentLayer = modelLayer('currents', currentSet, level, sun, SKYLINE.id)
+    const currentLayer = new PathLayer({
+      id: 'currents',
+      beforeId: SKYLINE.id,
+      data: currentSet.lines,
+      visible: currentSet.lines.length > 0,
+      widthUnits: 'pixels',
+      getPath: (line) => line.path,
+      getWidth: 1.5,
+      getColor: (line) => line.color,
+      capRounded: true,
+      jointRounded: true,
+    })
+    const currentDots = new ScatterplotLayer({
+      id: 'current-slack',
+      beforeId: SKYLINE.id,
+      data: currentSet.dots,
+      visible: currentSet.dots.length > 0,
+      radiusUnits: 'pixels',
+      getPosition: (dot) => dot.position,
+      getRadius: 2,
+      getFillColor: (dot) => dot.color,
+    })
     const currentLabels = new TextLayer({
       id: 'current-labels',
       beforeId: SKYLINE.id,
@@ -854,12 +1008,9 @@ export default function App() {
       visible: zoom >= CURRENT_LABELS_ZOOM && currentSet.labels.length > 0,
       getPosition: (label) => label.position,
       getText: (label) => label.text,
-      getSize: 11,
-      getColor: [226, 232, 240],
-      getPixelOffset: [0, 18],
-      background: true,
-      getBackgroundColor: [15, 23, 42, 190],
-      backgroundPadding: [3, 1],
+      getSize: 10,
+      getColor: [203, 213, 225, 200],
+      getPixelOffset: [0, 12],
       parameters: { depthCompare: 'always', depthWriteEnabled: false },
     })
     const objectLayers = [...standing, ...afloat].map((set, i) => modelLayer(`objects-${i < standing.length ? 'standing' : 'afloat'}-${set.id}`, set, level, sun, SKYLINE.id))
@@ -978,14 +1129,27 @@ export default function App() {
       getPixelOffset: [0, -12],
       parameters: { depthCompare: 'always', depthWriteEnabled: false },
     })
+    // a fleet vessel's recorded track, from the Fleet tab
+    const fleetTrackLayer = new PathLayer({
+      id: 'fleet-track',
+      beforeId: SKYLINE.id,
+      data: fleetTrack?.pieces ?? [],
+      visible: !!fleetTrack,
+      widthUnits: 'pixels',
+      getPath: (piece) => piece.map(([lng, lat]) => [lng, lat]),
+      getWidth: 2,
+      getColor: [196, 181, 253, 220],
+      parameters: { depthCompare: 'always', depthWriteEnabled: false },
+    })
     overlay.current?.setProps({
       layers: [
-        new Charts({ id: 'charts', beforeId: INLAND_WATER.id, data, show, zoom, level, contours, sun }),
+        new Charts({ id: 'charts', beforeId: INLAND_WATER.id, visible: !globe, data, showing, standby, show, zoom, level, contours, sun }),
         boxLayer,
         dotLayer,
         ...objectLayers,
         lightLayer,
         currentLayer,
+        currentDots,
         currentLabels,
         trackLayer,
         routeLayer,
@@ -993,12 +1157,13 @@ export default function App() {
         tickLabels,
         vesselLayer,
         vesselDotLayer,
+        fleetTrackLayer,
         measureLegs,
         measurePoints,
         measureLabels,
       ].filter(Boolean),
     })
-  }, [shown, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, vesselModels, standing, afloat, vesselTrack, currentSet, vesselRoute, legs, measured])
+  }, [kept, showing, standby, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, vesselModels, standing, afloat, vesselTrack, currentSet, vesselRoute, legs, measured, globe, fleetTrack])
 
   useEffect(() => {
     if (map.current?.getLayer(INLAND_WATER.id)) {
@@ -1385,6 +1550,22 @@ export default function App() {
       <div ref={mapBox} className="h-full" />
       <SideMenu menus={menus} />
       {ready && <WeatherCanvas map={map.current} weather={weather} land={land} hour={hourIndex} wind={show.wind} waves={show.waves} swell={show.swell} />}
+      {/* the two views, along the top: the map, and the fleets' histories over it */}
+      <div role="tablist" aria-label="Views" className="absolute top-3 right-4 z-30 flex rounded-lg border border-slate-700 bg-slate-900/95 p-0.5 text-sm shadow-xl">
+        {['map', 'fleet'].map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
+            className={`rounded-md px-3 py-1 ${tab === id ? 'bg-cyan-400/15 text-cyan-300' : 'text-slate-300 hover:text-cyan-300'}`}
+          >
+            {id === 'map' ? 'Map' : 'Fleet'}
+          </button>
+        ))}
+      </div>
+      {tab === 'fleet' && <FleetView showTrack={showFleetTrack} />}
       <SearchBar go={goTo} />
       {measuring && (
         <p role="status" className="absolute top-16 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-yellow-300/40 bg-slate-900/95 px-3 py-1.5 text-sm text-yellow-100 shadow-xl">

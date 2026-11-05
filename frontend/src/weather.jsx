@@ -101,6 +101,13 @@ export function WeatherCanvas({ map, weather, land, hour, wind, waves, swell }) 
       const { lng, lat } = map.unproject([Math.random() * c.width, Math.random() * c.height])
       return { lng, lat, age: Math.floor(Math.random() * LIFE) }
     }
+    // on a globe, what's round the back is still somewhere on screen: those are left out
+    const seen = (p) => {
+      if (map.getProjection().type !== 'globe') return true
+      const { lng, lat } = map.getCenter()
+      const r = Math.PI / 180
+      return Math.sin(lat * r) * Math.sin(p.lat * r) + Math.cos(lat * r) * Math.cos(p.lat * r) * Math.cos((p.lng - lng) * r) > 0.1
+    }
     const reset = () => {
       size()
       ctx.clearRect(0, 0, c.width, c.height)
@@ -131,7 +138,7 @@ export function WeatherCanvas({ map, weather, land, hour, wind, waves, swell }) 
         for (const s of streaks) {
           const knots = weatherAt(w, 'wind', h, s.lng, s.lat)
           const from = directionAt(w, 'windFrom', h, s.lng, s.lat)
-          if (knots === null || from === null || ++s.age > LIFE) {
+          if (knots === null || from === null || ++s.age > LIFE || !seen(s)) {
             Object.assign(s, somewhere(), { age: 0 })
             continue
           }
@@ -159,7 +166,7 @@ export function WeatherCanvas({ map, weather, land, hour, wind, waves, swell }) 
       for (const s of crests) {
         const high = weatherAt(w, look.height, h, s.lng, s.lat)
         const from = directionAt(w, look.from, h, s.lng, s.lat)
-        if (high === null || from === null || ++s.age > look.life) {
+        if (high === null || from === null || ++s.age > look.life || !seen(s)) {
           Object.assign(s, somewhere(), { age: 0 })
           // calm seas show fewer crests: the rest sit out this life
           s.calm = high === null || Math.random() > 0.2 + high / look.full

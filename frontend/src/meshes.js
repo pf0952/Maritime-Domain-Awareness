@@ -187,14 +187,14 @@ Mesh.layerName = 'Mesh'
 
 const ONE = [{}]
 
-function chartLayers(chart, show, zoom, level, contours, sun) {
+function chartLayers(chart, on, show, zoom, level, contours, sun) {
   const mesh = (key, visible, topology = 'triangle-list') =>
     chart.meshes[key] &&
     new Mesh({
       id: `${chart.id}-${key}`,
       data: ONE,
       mesh: chart.meshes[key],
-      visible,
+      visible: on && visible,
       topology,
       level,
       // walls take the depth colours but no lines: a chart's edge hangs through every depth, and would draw them all
@@ -248,10 +248,14 @@ export function modelLayer(id, { mesh, origin }, level, sun, beforeId) {
 // one layer to MapLibre, however many charts are showing
 export class Charts extends CompositeLayer {
   renderLayers() {
-    const { data, show, zoom, level, contours, sun } = this.props
+    const { data, showing, standby, show, zoom, level, contours, sun } = this.props
     // the sea last, as all but what no chart covers is hidden, and hidden costs a CPU nothing
     const all = sun.lit ? [...data, WORLD_SEA] : data
-    return all.flatMap((chart) => chartLayers(chart, show, zoom, level, contours, sun))
+    // Those showing, and hidden, those of the levels of detail either side, so that zooming across to one shows it
+    // that frame: making a chart's layers takes a moment, enough to stutter. The rest are kept as they arrived, with no
+    // layers, which would cost a CPU every frame even hidden
+    const on = (chart) => chart === WORLD_SEA || showing.has(chart.id)
+    return all.filter((chart) => on(chart) || standby.has(chart.id)).flatMap((chart) => chartLayers(chart, on(chart), show, zoom, level, contours, sun))
   }
 }
 Charts.layerName = 'Charts'
