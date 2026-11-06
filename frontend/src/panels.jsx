@@ -21,6 +21,9 @@ export function syncMessage(sync) {
 
 export function TidePanel({ tide, hour, setHour }) {
   if (!tide) return null
+  if (tide.failed) {
+    return <p className={`${TIDE_CARD} text-sm text-amber-200`}>The tide couldn't be had just now: trying again shortly</p>
+  }
   if (!tide.station) {
     return <p className={`${TIDE_CARD} text-sm text-slate-300`}>No tide station near here</p>
   }
@@ -106,18 +109,23 @@ export function SearchBar({ go }) {
   const [query, setQuery] = useState('')
   const [places, setPlaces] = useState([])
   const [note, setNote] = useState('')
+  const asking = useRef(null)
 
   async function search(e) {
     e.preventDefault()
     if (!query.trim()) return
+    // (a slow answer to an earlier search mustn't land on top of this one's)
+    asking.current?.abort()
+    const { signal } = (asking.current = new AbortController())
     setNote('Searching')
     setPlaces([])
     const q = encodeURIComponent(query.trim())
     const [towns, ships] = await Promise.all([
-      fetch(`/api/search?q=${q}`).then((res) => (res.ok ? res.json() : null), () => null),
+      fetch(`/api/search?q=${q}`, { signal }).then((res) => (res.ok ? res.json() : null), () => null),
       // Open Waters looks up a ship by name or MMSI, wherever it is
-      fetch(`${AIS}?q=${q}`).then((res) => (res.ok ? res.json() : null), () => null),
+      fetch(`${AIS}?q=${q}`, { signal }).then((res) => (res.ok ? res.json() : null), () => null),
     ])
+    if (signal.aborted) return
     const vessels = (ships?.features ?? []).slice(0, VESSELS_FOUND).map(({ geometry: { coordinates: [lng, lat] }, properties }) => ({
       name: properties.name || String(properties.mmsi),
       vessel: { ...properties, hdg: properties.heading ?? properties.cog, lng, lat },
@@ -153,7 +161,7 @@ export function SearchBar({ go }) {
         onKeyDown={(e) => {
           if (e.key === 'Escape') setPlaces([])
         }}
-        className="w-full rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 shadow-xl outline-none placeholder:text-slate-400 focus:border-cyan-400"
+        className="w-full rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 shadow-xl placeholder:text-slate-400 focus:border-cyan-400"
       />
       {note && <p className="mt-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">{note}</p>}
       {places.length > 1 && (
@@ -240,7 +248,7 @@ export function VesselCard({ vessel, detail, route, close }) {
           <h2 className="font-semibold">{fields.name ?? 'Unnamed vessel'}</h2>
           <p className="text-xs text-slate-400">{vesselCategory(fields)}, MMSI {vessel.mmsi}</p>
         </div>
-        <button type="button" aria-label="Close" onClick={close} className="rounded px-1 text-slate-300 hover:text-cyan-300">
+        <button type="button" aria-label="Close" onClick={close} className="grid size-7 shrink-0 place-items-center rounded-md text-lg leading-none text-slate-300 hover:bg-slate-800 hover:text-cyan-300">
           ×
         </button>
       </header>
@@ -288,5 +296,58 @@ export function LoadingScreen({ sync }) {
         <p className="mt-4 text-sm text-slate-400">Every chart is prepared now, so that the map is quick once you're in. It only takes this long the first time.</p>
       </div>
     </main>
+  )
+}
+
+// A piece of bridge someone clicked: its charted clearance, and what's under it at the tide bar's hour. US charts give
+// clearances above Mean High Water, so the room under it is that plus MHW, less the water's height above chart datum
+export function BridgeCard({ bridge, tide, hour, close }) {
+  const level = tide?.station ? tide.levels[hour + TIDE_HOURS] : null
+  const mhw = tide?.mhw
+  const now = (clearance) => (clearance != null && level != null && mhw != null ? clearance + mhw - level : null)
+  const m = (v) => `${v.toFixed(1)} m`
+  const when = hour === 0 ? 'now' : `at ${hour > 0 ? '+' : '−'}${Math.abs(hour)} h`
+  const opens = bridge.open != null
+  const under = now(bridge.clearance)
+  const rows = [
+    [`Charted clearance${opens ? ', closed' : ''}`, bridge.charted != null ? `${m(bridge.charted)} above MHW` : bridge.clearance != null ? `${m(bridge.clearance)}, from the span it joins` : 'not charted'],
+    opens && ['Charted clearance, open', `${m(bridge.open)} above MHW`],
+    opens && now(bridge.open) != null && [`Open, ${when}`, m(now(bridge.open))],
+    bridge.wide != null && ['Horizontal clearance', m(bridge.wide)],
+    level != null && [`Water ${when}`, `${m(level)} above ${tide.datum}`],
+    mhw != null && tide.datum === 'MLLW' && ['MHW', `${m(mhw)} above MLLW, ${tide.mhw_from}`],
+    tide?.station && ['Tide station', `${tide.station.name}, ${tide.station.km} km`],
+  ].filter(Boolean)
+  return (
+    <section
+      aria-label={`Bridge ${bridge.name ?? ''}`}
+      className="absolute top-16 right-4 flex w-80 max-w-[calc(100%-2rem)] flex-col gap-2 rounded-xl border border-slate-700 bg-slate-900/95 p-4 text-sm text-slate-100 shadow-xl"
+    >
+      <header className="flex items-start justify-between gap-2">
+        <div>
+          <h2 className="font-semibold">{bridge.name ?? 'Bridge'}</h2>
+          <p className="text-xs text-slate-400">{bridge.type ? `${bridge.type[0].toUpperCase()}${bridge.type.slice(1)} bridge` : 'Bridge'}</p>
+        </div>
+        <button type="button" aria-label="Close" onClick={close} className="grid size-7 shrink-0 place-items-center rounded-md text-lg leading-none text-slate-300 hover:bg-slate-800 hover:text-cyan-300">
+          ×
+        </button>
+      </header>
+      {under != null ? (
+        <p className="font-medium text-cyan-300 tabular-nums">
+          {m(under)} <span className="font-normal text-slate-400">vertical clearance {when}{opens ? ', closed' : ''}</span>
+        </p>
+      ) : (
+        <p className="text-slate-400">{bridge.clearance == null ? 'The chart gives no clearance here' : 'No tide station near: charted clearance only'}</p>
+      )}
+      <dl className="flex flex-col gap-0.5 text-xs">
+        {rows.map(([key, value]) => (
+          <div key={key} className="flex justify-between gap-3">
+            <dt className="text-slate-400">{key}</dt>
+            <dd className="text-right tabular-nums">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      <p className="text-xs text-slate-400">From the chart and NOAA tides. Not for navigation.</p>
+    </section>
   )
 }

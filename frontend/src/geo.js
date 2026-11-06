@@ -1,11 +1,18 @@
 // Map and sky maths shared by the viewer's parts, and whether the CPU is doing the drawing
 export const EMPTY = { type: 'FeatureCollection', features: [] }
+export const LAND_TOP = 15 // m: the land's height, backend/charts.py's LAND_HEIGHT
+// the pieces of the view that aren't NOAA's charts: the world's land, coast and seabed
+export const notChart = (name) => /^(WORLD|COAST_|SEA_)/.test(name)
+// metres a screen pixel covers on the ground, at a latitude and zoom (40075016 m round the equator, over 512 px)
+export const metresPerPixel = (lat, zoom) => (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
 
 // with hardware acceleration off in the browser, the CPU draws everything, and every point of every shape costs it
 function drawnInSoftware() {
   const gl = document.createElement('canvas').getContext('webgl2')
   const info = gl?.getExtension('WEBGL_debug_renderer_info')
-  return /basic render|swiftshader|llvmpipe|software/i.test(info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : '')
+  const software = /basic render|swiftshader|llvmpipe|software/i.test(info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : '')
+  gl?.getExtension('WEBGL_lose_context')?.loseContext() // (a context held for nothing counts against the browser's few)
+  return software
 }
 export const SOFTWARE = drawnInSoftware()
 

@@ -214,7 +214,7 @@ function AddVessel({ add, full }) {
           setQuery(e.target.value)
           setFound(null)
         }}
-        className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none placeholder:text-slate-400 focus:border-cyan-400 disabled:opacity-50"
+        className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-cyan-400 disabled:opacity-50"
       />
       {found && (
         <ul className="absolute top-full right-0 left-0 z-10 mt-1 max-h-80 overflow-auto rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl">
@@ -264,9 +264,13 @@ function Sources({ hasVessels }) {
 
   const ask = async (path, options) => {
     setProblem('')
-    const res = await fetch(path, options)
-    if (res.ok) setState(await res.json())
-    else setProblem((await res.json().catch(() => null))?.detail ?? `Couldn't: ${res.status}`)
+    try {
+      const res = await fetch(path, options)
+      if (res.ok) setState(await res.json())
+      else setProblem((await res.json().catch(() => null))?.detail ?? `Couldn't: ${res.status}`)
+    } catch {
+      setProblem("The app's server can't be reached just now") // (and asked again in a few seconds)
+    }
   }
   useEffect(() => {
     ask('/api/fleet/sources')
@@ -314,7 +318,7 @@ function Sources({ hasVessels }) {
               aria-label="Global Fishing Watch token"
               placeholder={state?.gfwToken ? 'Token saved: paste a new one to replace it' : 'Paste your token'}
               autoComplete="off"
-              className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 outline-none focus:border-cyan-400"
+              className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 focus:border-cyan-400"
             />
             <button type="submit" disabled={!token.trim()} className={button}>Save token</button>
             <button type="button" disabled={!state?.gfwToken || running || !hasVessels} onClick={() => ask('/api/fleet/backfill/gfw', { method: 'POST' })} className={button}>
@@ -429,7 +433,7 @@ export function FleetView({ showTrack }) {
             }}
             className="flex gap-2 text-sm"
           >
-            <input value={naming} onChange={(e) => setNaming(e.target.value)} aria-label="New fleet's name" placeholder="New fleet's name" maxLength={80} className="w-40 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 outline-none focus:border-cyan-400" />
+            <input value={naming} onChange={(e) => setNaming(e.target.value)} aria-label="New fleet's name" placeholder="New fleet's name" maxLength={80} className="w-40 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 focus:border-cyan-400" />
             <button type="submit" className="rounded-lg bg-slate-800 px-3 py-1.5 text-cyan-300 hover:bg-slate-700">New fleet</button>
           </form>
           {current && <button type="button" onClick={remove} className="rounded-lg px-2 py-1.5 text-sm text-slate-400 hover:text-red-300">Delete fleet</button>}

@@ -52,6 +52,9 @@ def grid(west: float, south: float, east: float, north: float) -> tuple:
 
 def fetch(points: list) -> None:
     """Every field for these points, from both of Open-Meteo's services."""
+    now = time.time()
+    for p in [p for p, (expires, *_) in point_cache.items() if expires <= now]:  # (stale ones would only pile up)
+        del point_cache[p]
     found = {p: {} for p in points}
     start = None
     for url, fields in FIELDS.items():

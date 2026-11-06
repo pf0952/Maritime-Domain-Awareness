@@ -1,19 +1,21 @@
-﻿import { PathLayer, PolygonLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers'
-import { CURRENTS_ZOOM, OBJECTS_ZOOM, currentArrows, objectMeshes, vesselMesh } from './models'
+import { CURRENTS_ZOOM, OBJECTS_ZOOM, bridgeAt, bridgeDecks, currentArrows, deckAt, objectMeshes, vesselMesh } from './models'
 import { CRESTS, WIND_RGB, WeatherCanvas, directionAt, indexWeather, unpackLand, weatherAt } from './weather'
+import { WebMercatorViewport } from '@deck.gl/core'
 import { MapboxOverlay } from '@deck.gl/mapbox'
 import { VectorTile } from '@mapbox/vector-tile'
 import * as maplibregl from 'maplibre-gl'
 import maplibreWorker from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import { PbfReader } from 'pbf'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { EMPTY, SOFTWARE, daylightAt, fromOutline, onOutline, overlaps, rhumb, sunAt, tileAt, tileToLat, tileToLng } from './geo'
-import { AIDS, AIS, PLEASURE, VESSEL_CATEGORIES, VESSEL_DOT, VESSEL_FOUND_ZOOM, VESSEL_REFRESH, vesselAt, vesselCategory, vesselLengthAt, vesselShape, vesselTiles } from './vessels'
-import { ROMAN, WARNING_AGES, WARNING_CATEGORIES, WARNING_DOT, WARNING_DOT_PICKED, WARNING_EDGE, WARNING_FILL, WARNING_FILL_PICKED, cutFeeds, warningShapes, warningsAt } from './warnings'
-import { Charts, modelLayer, unpack } from './meshes'
+import { EMPTY, SOFTWARE, daylightAt, fromOutline, onOutline, overlaps, rhumb, sunAt, tileAt, tileToLat, tileToLng, LAND_TOP, metresPerPixel, notChart } from './geo'
+import { AIS, PLEASURE, VESSEL_CATEGORIES, VESSEL_FOUND_ZOOM, VESSEL_REFRESH, vesselAt, vesselCategory, vesselLengthAt, vesselShape, vesselTiles } from './vessels'
+import { ROMAN, WARNING_AGES, WARNING_CATEGORIES, cutFeeds, warningShapes, warningsAt } from './warnings'
+import { unpack } from './meshes'
+import { INLAND_WATER_ID, SKYLINE_ID, buildLayers, ROUTE_RGB, FINDING_RGB, miles, trueBearing } from './layers'
 import { ICONS, Section, SideMenu, Toggle } from './menu'
+import { RoutesPanel, legsOf, newRoute, pathsOf } from './routes'
 import { FleetView } from './fleet'
-import { LoadingScreen, SearchBar, TIDE_HOURS, TidePanel, VesselCard, syncMessage } from './panels'
+import { BridgeCard, LoadingScreen, SearchBar, TIDE_HOURS, TidePanel, VesselCard, syncMessage } from './panels'
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
 const OCEAN = '#081e42'
@@ -25,13 +27,35 @@ const GLOBE_LAND = 'rgb(47, 53, 64)' // backend/charts.py's LAND_RGB
 const CHARTS_ZOOM = 4 // further out than this, there's just the world's land: charts would be specks
 const POLL = 5000 // ms
 const TIDE_REFRESH = 600000 // ms
-const LAND_TOP = 15 // m: backend/charts.py's LAND_HEIGHT
 const BUILDING_HEIGHT = 8 // m, for ones that have none on record
 const BUILDINGS_ZOOM = 12 // further out, the map's tiles hold only a few stubs, so those come from...
 const SKYLINE_ZOOM = 10 // ...tiles of this zoom's, read here, from this far out
 const SKYLINE_TILE_ZOOM = 12
-const SKYLINE_TILES = 64 // at most at once, nearest first
-const SKYLINE_KEPT = 400 // tiles held in memory
+const SKYLINE_TILES = 32 // at most at once, nearest first: the buildings are the most a CPU has to draw
+const BRIDGES_ZOOM = 11 // bridges show from this far out, true to size; the charts' other objects only from OBJECTS_ZOOM
+// the street map's tiles whose roads say which are bridges: one level finer than the view, from its 12 (its coarser
+// ones don't say) to its finest, 15
+const bridgeTileZoom = (zoom) => Math.min(15, Math.max(12, Math.floor(zoom) + 1))
+const BRIDGE_TILES = 48 // at most at once, nearest the middle first
+const BRIDGE_KEPT = 300 // tiles held in memory
+const SKYLINE_KEPT = 128 // tiles held in memory
+const OBJECTS_KEPT = 400 // charts' objects held in memory
+
+// A Map used as a cache of so many, the most lately used last: what's used is moved to the end, and the first go
+function used(cache, keys) {
+  for (const key of keys) {
+    if (!cache.has(key)) continue
+    const value = cache.get(key)
+    cache.delete(key)
+    cache.set(key, value)
+  }
+}
+function trim(cache, most) {
+  for (const key of cache.keys()) {
+    if (cache.size <= most) break
+    cache.delete(key)
+  }
+}
 const OVERVIEW_ASPECT = 13 / 8 // the general map's shape
 const OVERVIEW_NARROWEST = 40 // degrees across: it stays a general map, however far in you go
 const CUBE_FACES = [
@@ -49,18 +73,20 @@ const WARNINGS_LAG = 180000 // ms after the hour
 const WARNINGS_RETRY = 15000 // ms: while the first ever look through the feeds is going on
 const GREY_AFTER = 250 // ms of loading before the screen greys, or every small pan would flash
 const UNGREY_AFTER = 150 // ms of quiet before it clears, as one thing's end can come just before the next one's start
-const LIGHT_DOT = 3 // px
 const ALIVE_EVERY = 10000 // ms: how often a window tells the server it's open (backend/launch.py)
 const TRACK_GAP = 12 * 3600 // s: reports further apart than this aren't joined up on the map
 const BERTH_ZOOM = 15 // closer than this, vessels are drawn about true to size, and alongside quays they're set clear of them
 const STOPPED = 0.5 // knots
-const CURRENT_LABELS_ZOOM = 12 // further out, the arrows go without their speeds
 const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 const compass = (degrees) => COMPASS[Math.round(degrees / 45) % 8]
-const MEASURE_RGB = [253, 224, 71]
-// distances as a chart gives them, and short ones in metres too; bearings true, in three figures
-const miles = (nm) => (nm < 1 ? `${nm.toFixed(2)} nm (${Math.round(nm * 1852)} m)` : `${nm.toLocaleString([], { maximumFractionDigits: nm < 100 ? 2 : 1 })} nm`)
-const trueBearing = (degrees) => `${String(Math.round(degrees) % 360).padStart(3, '0')}°T`
+const WAYPOINT_REACH = 10 // px: a click this near a waypoint picks it, or starts a drag
+const LEG_REACH = 7 // px: a click this near a leg puts a new waypoint in it
+// px from a point to a segment on screen
+function toSegment([px, py], [ax, ay], [bx, by]) {
+  const [dx, dy] = [bx - ax, by - ay]
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1)))
+  return Math.hypot(px - ax - t * dx, py - ay - t * dy)
+}
 // how each shows on the map, as the key beside its switch
 const mark = (path, rgb, width) => (
   <svg viewBox="0 0 24 12" className="h-3 w-6 shrink-0" aria-hidden="true">
@@ -95,7 +121,7 @@ const BUILDING_LOOK = {
 // OpenStreetMap's coast stops at river mouths, so its land runs over harbours and rivers. Painted on top of it, beyond
 // the charts, as those have their own. It's flat, at a harbour's sort of depth by the charts' colours, as no depth comes with it
 const INLAND_WATER = {
-  id: 'inland-water',
+  id: INLAND_WATER_ID,
   type: 'fill',
   source: 'protomaps',
   'source-layer': 'water',
@@ -103,7 +129,7 @@ const INLAND_WATER = {
   filter: ['all', ['==', ['geometry-type'], 'Polygon'], ['!=', ['get', 'kind'], 'ocean']],
   paint: { 'fill-color': 'rgb(78, 150, 176)' },
 }
-const SKYLINE = { ...BUILDING_LOOK, id: 'skyline', source: 'skyline', minzoom: SKYLINE_ZOOM, maxzoom: BUILDINGS_ZOOM }
+const SKYLINE = { ...BUILDING_LOOK, id: SKYLINE_ID, source: 'skyline', minzoom: SKYLINE_ZOOM, maxzoom: BUILDINGS_ZOOM }
 const BUILDINGS = {
   ...BUILDING_LOOK,
   id: 'buildings',
@@ -112,17 +138,28 @@ const BUILDINGS = {
   minzoom: BUILDINGS_ZOOM,
 }
 
-// vessels' traffic, warm on the blue of the sea: the map's own heatmap, which only shows further out than this
-const HEATMAP_ZOOM = 9
+// vessels' traffic, warm on the blue of the sea: the map's own heatmap. Further out than this it stands for them;
+// closer in, where the vessels themselves are drawn true to size, it narrows to a glow round each, in the same colours,
+// so the one gives way to the other smoothly and they stand out from the water
+const HEATMAP_ZOOM = 12
+const GLOW = 0.6 // of a vessel's length, its glow's reach from its middle, closer in than HEATMAP_ZOOM
+const GLOW_LEAST = 12 // px
 const TRAFFIC = {
   id: 'traffic',
   type: 'heatmap',
   source: 'traffic',
-  maxzoom: HEATMAP_ZOOM,
   paint: {
-    'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 2, 5, HEATMAP_ZOOM, 20],
-    'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 2, 0.5, HEATMAP_ZOOM, 1.5],
-    'heatmap-opacity': 0.85,
+    // (closer in, sized to the vessel: its property px is its length in pixels at zoom 0, so 2^zoom times that on
+    // screen; the glow reaches GLOW times that from its middle, and never less than GLOW_LEAST)
+    'heatmap-radius': [
+      'interpolate', ['exponential', 2], ['zoom'],
+      2, 5,
+      HEATMAP_ZOOM, 20,
+      HEATMAP_ZOOM + 1, ['max', GLOW_LEAST, ['*', GLOW * 2 ** (HEATMAP_ZOOM + 1), ['get', 'px']]],
+      22, ['max', GLOW_LEAST, ['*', GLOW * 2 ** 22, ['get', 'px']]],
+    ],
+    'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 2, 0.5, HEATMAP_ZOOM, 1.5, HEATMAP_ZOOM + 2, 0.9],
+    'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], HEATMAP_ZOOM, 0.85, HEATMAP_ZOOM + 3, 0.6, 18, 0.45],
     'heatmap-color': [
       'interpolate', ['linear'], ['heatmap-density'],
       0, 'rgba(0, 0, 0, 0)',
@@ -134,23 +171,26 @@ const TRAFFIC = {
   },
 }
 
-// the tiles of the skyline in view that a detailed chart reaches, nearest the middle first
-function skylineTiles(m, detailed) {
-  const bounds = m.getBounds() // (past 180 on later copies of the world; tile numbers come back round)
-  const from = tileAt(bounds.getWest(), bounds.getNorth(), SKYLINE_TILE_ZOOM)
-  const to = tileAt(bounds.getEast(), bounds.getSouth(), SKYLINE_TILE_ZOOM)
+// the tiles of a zoom in view, nearest the middle first
+function tilesInView(m, z, most) {
+  const bounds = m.getBounds()
+  const from = tileAt(bounds.getWest(), bounds.getNorth(), z)
+  const to = tileAt(bounds.getEast(), bounds.getSouth(), z)
   const { lng, lat } = m.getCenter()
-  const middle = tileAt(lng, lat, SKYLINE_TILE_ZOOM)
+  const middle = tileAt(lng, lat, z)
   const tiles = []
-  const z = SKYLINE_TILE_ZOOM
   for (let across = Math.floor(from.x); across <= to.x; across++) {
     const x = ((across % 2 ** z) + 2 ** z) % 2 ** z
-    for (let y = Math.max(Math.floor(from.y), 0); y <= to.y; y++) {
-      const here = overlaps(tileToLng(x, z), tileToLat(y + 1, z), tileToLng(x + 1, z), tileToLat(y, z))
-      if (detailed.some(here)) tiles.push({ x, y, away: (across - middle.x) ** 2 + (y - middle.y) ** 2 })
-    }
+    for (let y = Math.max(Math.floor(from.y), 0); y <= Math.min(to.y, 2 ** z - 1); y++) tiles.push({ x, y, away: (across - middle.x) ** 2 + (y - middle.y) ** 2 })
   }
-  return tiles.sort((a, b) => a.away - b.away).slice(0, SKYLINE_TILES)
+  return tiles.sort((a, b) => a.away - b.away).slice(0, most)
+}
+
+// the tiles of the skyline in view that a detailed chart reaches, nearest the middle first
+function skylineTiles(m, detailed) {
+  const z = SKYLINE_TILE_ZOOM
+  const reached = ({ x, y }) => detailed.some(overlaps(tileToLng(x, z), tileToLat(y + 1, z), tileToLng(x + 1, z), tileToLat(y, z)))
+  return tilesInView(m, z, Infinity).filter(reached).slice(0, SKYLINE_TILES)
 }
 
 const tierAt = (zoom) => (zoom < CHARTS_ZOOM ? 0 : 2 + TIER_ZOOMS.filter((z) => zoom >= z).length)
@@ -169,6 +209,7 @@ export default function App() {
   const [showing, setShowing] = useState(new Set()) // keys of the ones showing
   const [standby, setStandby] = useState(new Set()) // and of those fetched ahead, for the levels of detail either side
   const shown = useMemo(() => kept.filter((chart) => showing.has(chart.id)), [kept, showing]) // the charts in view
+  const [bridgeRoads, setBridgeRoads] = useState([]) // the street map's bridges in view: { coords, kind }
   const [objects, setObjects] = useState([]) // their buoys, landmarks and the like, when close enough in: { id, things }
   const [charts, setCharts] = useState([]) // the ones uploaded
   const [loading, setLoading] = useState(false)
@@ -227,12 +268,21 @@ export default function App() {
   const [pickedTurn, setPickedTurn] = useState(0) // which of them is showing
   const warningsOnMap = useRef({ boxes: [], dots: [] }) // for the map's own handlers
   const vesselsOnMap = useRef([])
+  const bridgesOnMap = useRef({ sets: [], mhw: 0 })
+  const [pickedBridge, setPickedBridge] = useState(null)
   const trafficNow = useRef(EMPTY) // for the heatmap, when the map's style has loaded
   const [measuring, setMeasuring] = useState(false) // clicks on the map add points to measure between
   const [measured, setMeasured] = useState([]) // [lng, lat] of each point
   const [aim, setAim] = useState(null) // where the cursor is, while measuring: the next leg runs to it
   const measuringNow = useRef(false)
   measuringNow.current = measuring
+  const [route, setRoute] = useState(() => newRoute()) // the route open in the Routes panel
+  const [routeMode, setRouteMode] = useState(null) // 'edit': clicks lay waypoints; 'plan': clicks set its two ends
+  const [planEnds, setPlanEnds] = useState([])
+  const [findings, setFindings] = useState(null) // the last check's
+  const [pickedWaypoint, setPickedWaypoint] = useState(null)
+  const routeNow = useRef({})
+  routeNow.current = { route, mode: routeMode }
   const loadVessels = useRef(null)
   const vesselsOn = useRef(true)
   const overWarning = useRef(false)
@@ -282,10 +332,13 @@ export default function App() {
     if (!ready) return
     const m = new maplibregl.Map({
       container: mapBox.current,
-      center: [-71, 42],
-      zoom: 6,
+      // drawn by the CPU, every pixel costs: a high-density screen's extra ones (Windows' scaling) aren't worth it
+      pixelRatio: SOFTWARE ? 1 : window.devicePixelRatio,
+      // the whole globe, the Atlantic in the middle
+      center: [-40, 30],
+      zoom: 2,
       minZoom: 1,
-      pitch: 45,
+      pitch: 0,
       attributionControl: { compact: true },
       // cliffs' edges shimmer as the camera moves without it, but it's four times the work for a CPU
       canvasContextAttributes: { antialias: !SOFTWARE },
@@ -304,7 +357,8 @@ export default function App() {
           if (l.id === 'water') return { ...l, maxzoom: GLOBE_ZOOM, paint: { 'fill-color': OCEAN } }
           return l
         })
-      kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, INLAND_WATER, SKYLINE, BUILDINGS, TRAFFIC)
+      // (the traffic under the vessels' models, which go in just before the skyline: they stand on their glow)
+      kept.splice(kept.findIndex((l) => l.type === 'symbol'), 0, INLAND_WATER, TRAFFIC, SKYLINE, BUILDINGS)
       return kept
     }
     m.setStyle(BASEMAP, {
@@ -320,7 +374,7 @@ export default function App() {
     // interleaved: one canvas and one graphics context, so the map and charts can't drift apart as they move
     overlay.current = new MapboxOverlay({
       interleaved: true,
-      getCursor: ({ isDragging }) => (isDragging ? 'grabbing' : measuringNow.current ? 'crosshair' : overWarning.current ? 'pointer' : 'grab'),
+      getCursor: ({ isDragging }) => (isDragging ? 'grabbing' : measuringNow.current || routeNow.current.mode ? 'crosshair' : overWarning.current ? 'pointer' : 'grab'),
     })
     m.addControl(overlay.current)
     map.current = m
@@ -329,22 +383,28 @@ export default function App() {
     const tiers = new Map() // tier: the charts it needs and the area they're for, as last fetched
     let showing = new Set() // keys of the charts showing
     let shownTier = null
-    const haveObjects = new Map() // key: its objects
+    const haveObjects = new Map() // key: its objects, the most lately used last
+    let objectsShown = '' // the keys of those handed on last: the same again isn't, as it'd rebuild every model
     let request = null
 
-    // ponytail: keeps every chart's objects seen this visit; a few kB each, so drop old ones if a long session grows
     async function loadObjects(want, signal) {
-      if (m.getZoom() < OBJECTS_ZOOM) return
-      const enc = want.filter((c) => !/^(WORLD|COAST_|SEA_)/.test(c.name))
+      if (m.getZoom() < BRIDGES_ZOOM) return
+      const enc = want.filter((c) => !notChart(c.name))
       await Promise.all(
         enc
           .filter((c) => !haveObjects.has(c.key))
           .map(async (c) => {
-            const res = await fetch(`/api/objects/${c.name}/${c.tier}?key=${c.key}`, { signal })
+            const res = await fetch(`/api/objects/${c.name}/${c.tier}?key=${c.objects}`, { signal })
             if (res.ok) haveObjects.set(c.key, await res.json())
           }),
       )
-      setObjects(enc.filter((c) => haveObjects.has(c.key)).map((c) => ({ id: c.key, things: haveObjects.get(c.key) })))
+      const here = enc.filter((c) => haveObjects.has(c.key))
+      used(haveObjects, here.map((c) => c.key))
+      trim(haveObjects, OBJECTS_KEPT)
+      const keys = here.map((c) => c.key).join()
+      if (keys === objectsShown) return
+      objectsShown = keys
+      setObjects(here.map((c) => ({ id: c.key, things: haveObjects.get(c.key) })))
     }
 
     let tideRequest = null
@@ -356,9 +416,15 @@ export default function App() {
       const { lat, lng } = m.getCenter().wrap()
       try {
         const res = await fetch(`/api/tide?lat=${lat}&lon=${lng}`, { signal })
-        if (res.ok) setTide(await res.json())
+        // (the same station's same levels again, as after a short pan, are let be: a new object would redraw a lot)
+        if (res.ok) {
+          const next = await res.json()
+          setTide((was) => (was && was.station?.id === next.station?.id && was.now === next.now ? was : next))
+        }
+        else setTide((was) => was ?? { failed: true })
       } catch {
-        // the last levels stand until the next try
+        // the last levels stand until the next try; with none yet, the tide card says it couldn't be had
+        if (!signal.aborted) setTide((was) => was ?? { failed: true })
       }
       if (!signal.aborted) setTideAsked(true)
     }
@@ -405,9 +471,53 @@ export default function App() {
       m.getSource('skyline')?.setData({ ...EMPTY, features })
       skylineDrawn = names
       setSkylineLoading(false)
-      for (const key of skyline.keys()) {
-        if (skyline.size > SKYLINE_KEPT) skyline.delete(key)
+      used(skyline, tiles.map(({ x, y }) => `${x}/${y}`))
+      trim(skyline, SKYLINE_KEPT)
+    }
+
+    // the street map's roads and railways marked as bridges, close in: bridgeDecks builds them where the charts have one
+    const bridgeTiles = new Map() // tile: its bridges, the most lately used last
+    let bridgesShown = '' // the tiles handed on last: the same again isn't, as it'd rebuild the decks
+    let bridgeRequest = null
+    async function loadBridgeRoads() {
+      bridgeRequest?.abort()
+      const url = m.getSource('protomaps')?.tiles?.[0]
+      if (m.getZoom() < BRIDGES_ZOOM || !url) return
+      bridgeRequest = new AbortController()
+      const { signal } = bridgeRequest
+      const z = bridgeTileZoom(m.getZoom())
+      const tiles = tilesInView(m, z, BRIDGE_TILES)
+      try {
+        await Promise.all(
+          tiles
+            .filter(({ x, y }) => !bridgeTiles.has(`${z}/${x}/${y}`))
+            .map(async ({ x, y }) => {
+              const res = await fetch(url.replace('{z}', z).replace('{x}', x).replace('{y}', y), { signal })
+              if (!res.ok) return
+              const { roads } = new VectorTile(new PbfReader(await res.arrayBuffer())).layers
+              const lines = []
+              for (let i = 0; i < (roads?.length ?? 0); i++) {
+                const feature = roads.feature(i)
+                if (!feature.properties.is_bridge) continue
+                const { geometry } = feature.toGeoJSON(x, y, z)
+                const parts = geometry.type === 'LineString' ? [geometry.coordinates] : geometry.type === 'MultiLineString' ? geometry.coordinates : []
+                // (a tile's lines run a little past its edges: an end out there is where the tile cut it, not the bridge's end)
+                const [w, e, n, so] = [tileToLng(x, z), tileToLng(x + 1, z), tileToLat(y, z), tileToLat(y + 1, z)]
+                const cutAt = ([lng, lat]) => lng <= w || lng >= e || lat >= n || lat <= so
+                for (const coords of parts) lines.push({ coords, kind: feature.properties.kind, cut: [cutAt(coords[0]), cutAt(coords.at(-1))] })
+              }
+              bridgeTiles.set(`${z}/${x}/${y}`, lines)
+            }),
+        )
+      } catch (e) {
+        if (e.name === 'AbortError') return
       }
+      const keys = tiles.map(({ x, y }) => `${z}/${x}/${y}`).filter((key) => bridgeTiles.has(key))
+      used(bridgeTiles, keys)
+      trim(bridgeTiles, BRIDGE_KEPT)
+      if (keys.join() === bridgesShown) return
+      bridgesShown = keys.join()
+      setBridgeRoads(keys.flatMap((key) => bridgeTiles.get(key)))
     }
 
     // the cube and the general map follow the camera: no React here, they change every frame
@@ -528,6 +638,7 @@ export default function App() {
         setCharted(noaa)
         setDetailed(fine.length > 0)
         loadSkyline(fine)
+        loadBridgeRoads()
         const missing = want.filter((c) => !have.has(c.key))
         // grey only with nothing at all to show meanwhile: what's showing stays till this view has all arrived
         setLoading(missing.length > 0 && showing.size === 0)
@@ -595,19 +706,82 @@ export default function App() {
     }
     m.once('load', () => lightBuildings.current())
 
+    // a bridge's deck is drawn high above the water, so it's found where it's drawn, not on the chart below it
+    function bridgeUnder(m, x, y) {
+      const { sets, mhw, decks, claimed } = bridgesOnMap.current
+      if (!sets.length) return null
+      const { lng, lat } = m.getCenter()
+      const canvas = m.getCanvas()
+      const viewport = new WebMercatorViewport({
+        width: canvas.clientWidth, height: canvas.clientHeight, longitude: lng, latitude: lat,
+        zoom: m.getZoom(), pitch: m.getPitch(), bearing: m.getBearing(),
+      })
+      const project = (at) => viewport.project(at)
+      return deckAt(decks, project, x, y) ?? bridgeAt(sets, project, x, y, mhw, claimed)
+    }
+
+    // the waypoint of the open route near a point on screen, if any
+    const waypointNear = (x, y) => {
+      const at = routeNow.current.route.waypoints.map((w) => m.project([w.lng, w.lat]))
+      const i = at.findIndex((p) => Math.hypot(p.x - x, p.y - y) <= WAYPOINT_REACH)
+      return i < 0 ? null : i
+    }
+    let dragging = null // the waypoint being dragged
+    let dragged = false
+    m.on('mousedown', ({ point: { x, y } }) => {
+      if (routeNow.current.mode !== 'edit') return
+      dragging = waypointNear(x, y)
+      dragged = false
+      if (dragging != null) m.dragPan.disable()
+    })
+    m.on('mouseup', () => {
+      if (dragging == null) return
+      m.dragPan.enable()
+      if (dragged) setFindings(null)
+      dragging = null
+    })
+
     m.on('click', ({ point: { x, y }, lngLat }) => {
       if (measuringNow.current) {
         setMeasured((points) => [...points, [lngLat.lng, lngLat.lat]])
         return
       }
+      const { mode, route: open } = routeNow.current
+      const here = { lng: lngLat.lng, lat: lngLat.lat }
+      if (mode === 'plan') {
+        setPlanEnds((ends) => (ends.length < 2 ? [...ends, [here.lng, here.lat]] : ends)) // (a start and an end, no more)
+        return
+      }
+      if (mode === 'edit') {
+        if (dragged) {
+          dragged = false // (a drag ends in a click)
+          return
+        }
+        const near = waypointNear(x, y)
+        if (near != null) {
+          setPickedWaypoint(near)
+          return
+        }
+        const at = open.waypoints.map((w) => m.project([w.lng, w.lat]))
+        const leg = at.findIndex((p, i) => i > 0 && toSegment([x, y], [at[i - 1].x, at[i - 1].y], [p.x, p.y]) <= LEG_REACH)
+        const n = open.waypoints.length
+        const fresh = { ...here, name: `WP${n + 1}`, leg: { geometry: 'rhumb' } }
+        setRoute((r) => ({ ...r, waypoints: leg > 0 ? [...r.waypoints.slice(0, leg), fresh, ...r.waypoints.slice(leg)] : [...r.waypoints, fresh] }))
+        setPickedWaypoint(leg > 0 ? leg : n)
+        setFindings(null)
+        return
+      }
       const vessel = vesselAt(m, vesselsOnMap.current, x, y)
+      const bridge = vessel ? null : bridgeUnder(m, x, y)
       setPickedVessel(vessel)
-      setPickedWarnings(vessel ? [] : warningsAt(m, warningsOnMap.current, x, y))
+      setPickedBridge(bridge)
+      setPickedWarnings(vessel || bridge ? [] : warningsAt(m, warningsOnMap.current, x, y))
       setPickedTurn(0)
     })
     let hovering = null
-    m.on('mousemove', ({ point, lngLat }) => {
-      if (hovering) return
+    m.on('mousemove', ({ point, lngLat, originalEvent }) => {
+      // (not while the map's being dragged or is moving: nothing's hovered then, and every check costs a frame)
+      if (hovering || (originalEvent.buttons && dragging == null) || m.isMoving()) return
       hovering = requestAnimationFrame(() => {
         hovering = null
         if (measuringNow.current) {
@@ -615,8 +789,15 @@ export default function App() {
           m.getCanvas().style.cursor = 'crosshair'
           return
         }
+        if (dragging != null) {
+          dragged = true
+          const i = dragging
+          setRoute((r) => ({ ...r, waypoints: r.waypoints.map((w, k) => (k === i ? { ...w, lng: lngLat.lng, lat: lngLat.lat } : w)) }))
+          return
+        }
+        if (routeNow.current.mode) return
         const { x, y } = point
-        overWarning.current = !!vesselAt(m, vesselsOnMap.current, x, y) || warningsAt(m, warningsOnMap.current, x, y).length > 0
+        overWarning.current = !!vesselAt(m, vesselsOnMap.current, x, y) || !!bridgeUnder(m, x, y) || warningsAt(m, warningsOnMap.current, x, y).length > 0
         m.getCanvas().style.cursor = overWarning.current ? 'pointer' : 'grab'
       })
     })
@@ -650,6 +831,8 @@ export default function App() {
     if (vessel) {
       map.current.jumpTo({ ...camera, center: [vessel.lng, vessel.lat], zoom: VESSEL_FOUND_ZOOM })
       setPickedVessel(vessel)
+      setPickedBridge(null)
+      setPickedWarnings([])
       return
     }
     const [w, s, e, n] = bounds
@@ -699,7 +882,7 @@ export default function App() {
 
   useEffect(() => {
     vesselsOn.current = show.vessels
-    loadVessels.current?.()
+    loadVessels.current?.(true) // (afresh: those last shown may be long out of date)
   }, [show.vessels, ready])
 
   // currents and weather for the view: what's showing stays until the new arrives, and they never grey the screen
@@ -746,6 +929,29 @@ export default function App() {
     return points.slice(1).map((to, i) => ({ from: points[i], to, ...rhumb(points[i], to), live: measuring && !!aim && i === points.length - 2 }))
   }, [measured, aim, measuring])
   const measuredTotal = legs.filter((leg) => !leg.live).reduce((sum, leg) => sum + leg.nm, 0)
+  // Esc leaves laying or planning a route; Delete takes out the waypoint picked
+  useEffect(() => {
+    if (!routeMode && pickedWaypoint == null) return
+    const key = (e) => {
+      if (e.target.closest?.('input, select, textarea')) return
+      if (e.key === 'Escape' && routeMode) {
+        e.stopImmediatePropagation() // (heard first, as it listens in capture: the Routes menu stays open)
+        setRouteMode(null)
+        setPlanEnds([])
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && routeMode === 'edit' && pickedWaypoint != null) {
+        setRoute((r) => ({ ...r, waypoints: r.waypoints.filter((_, k) => k !== pickedWaypoint) }))
+        setPickedWaypoint(null)
+        setFindings(null)
+      }
+    }
+    window.addEventListener('keydown', key, true)
+    return () => window.removeEventListener('keydown', key, true)
+  }, [routeMode, pickedWaypoint])
+  useEffect(() => {
+    if (routeMode) setMeasuring(false)
+  }, [routeMode])
+
   const stopMeasuring = () => {
     setMeasuring(false)
     setAim(null)
@@ -754,11 +960,12 @@ export default function App() {
     if (!measuring) return
     const stop = (e) => {
       if (e.key !== 'Escape') return
+      e.stopImmediatePropagation() // (heard first, as it listens in capture: the open menu stays open)
       setMeasuring(false)
       setAim(null)
     }
-    window.addEventListener('keydown', stop)
-    return () => window.removeEventListener('keydown', stop)
+    window.addEventListener('keydown', stop, true)
+    return () => window.removeEventListener('keydown', stop, true)
   }, [measuring])
 
   // the tide bar's hour, as the arrays of hours from currents and weather count them
@@ -847,15 +1054,18 @@ export default function App() {
     [vessels, vesselCategories, show.vessels],
   )
   useEffect(() => {
-    trafficNow.current = { ...EMPTY, features: traffic.map((v) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [v.lng, v.lat] }, properties: {} })) }
+    // px: its length on screen at zoom 0, for the glow
+    const px = (v) => (v.length || 15) / metresPerPixel(v.lat, 0)
+    trafficNow.current = { ...EMPTY, features: traffic.map((v) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [v.lng, v.lat] }, properties: { px: px(v) } })) }
     map.current?.getSource('traffic')?.setData(trafficNow.current)
   }, [traffic])
+  // built at the water's zero, and lifted by the tide as they're drawn (vesselLift): the tide bar doesn't rebuild them
   const reportedShapes = useMemo(() => {
     const middle = map.current?.getCenter().lng ?? 0
-    // beyond the charts, harbours are painted on the land's top, not cut from it
-    const base = charted ? level : LAND_TOP
-    return vesselsDrawn.filter((v) => v.kind === 'vessel').map((v) => vesselShape(v, zoom, base, middle))
-  }, [filteredVessels, show.vessels, zoom, level, charted, searched[0], heatmap])
+    return vesselsDrawn.filter((v) => v.kind === 'vessel').map((v) => vesselShape(v, zoom, 0, middle))
+  }, [filteredVessels, show.vessels, zoom, searched[0], heatmap])
+  // beyond the charts, harbours are painted on the land's top, not cut from it
+  const vesselLift = charted ? level : LAND_TOP
 
   // close in, stopped vessels that'd be drawn into a pier or quay are laid alongside it instead (backend/berths.py)
   const [berths, setBerths] = useState({})
@@ -889,19 +1099,29 @@ export default function App() {
       }),
     [reportedShapes, berths, berthing],
   )
-  const vesselDots = vesselsDrawn.filter((v) => v.kind !== 'vessel')
+  const vesselDots = useMemo(() => vesselsDrawn.filter((v) => v.kind !== 'vessel'), [filteredVessels, show.vessels, heatmap, searched[0]])
   const vesselModels = useMemo(() => vesselMesh(vesselShapes, pickedVessel?.mmsi, zoom), [vesselShapes, pickedVessel, zoom])
 
   // rebuilt as the zoom changes, as each is kept big enough on screen to see; what floats, as the tide changes too
   const objectZoom = Math.round(zoom * 4) / 4
+  const mhw = tide?.mhw ?? 0 // bridges stand above it: none known, they stand from chart datum, too low by the range
   const objectsDrawn = useMemo(() => (show.objects && objectZoom >= OBJECTS_ZOOM ? objects : []), [objects, show.objects, objectZoom])
-  const standing = useMemo(
-    () => objectsDrawn.map(({ id, things }) => ({ id, ...objectMeshes(things, objectZoom, 0, false) })),
-    [objectsDrawn, objectZoom],
+  // the charts' bridges alone, which show from further out
+  const bridgeSets = useMemo(
+    () => (show.objects && objectZoom >= BRIDGES_ZOOM ? objects.map(({ id, things }) => ({ id, things: things.filter((t) => t.kind === 'bridge') })) : []),
+    [objects, show.objects, objectZoom],
   )
+  const deckSet = useMemo(() => bridgeDecks(bridgeSets.length ? bridgeRoads : [], bridgeSets, mhw), [bridgeRoads, bridgeSets, mhw])
+  bridgesOnMap.current = { sets: bridgeSets, mhw, decks: deckSet.decks, claimed: deckSet.claimed }
+  const standing = useMemo(
+    // (further out than OBJECTS_ZOOM, only the bridges the street map hasn't: as the chart's slabs)
+    () => (objectsDrawn.length ? objectsDrawn : bridgeSets).map(({ id, things }) => ({ id, ...objectMeshes(things, objectZoom, 0, false, mhw, deckSet.claimed) })),
+    [objectsDrawn, bridgeSets, objectZoom, mhw, deckSet],
+  )
+  // (at the water's zero: the tide lifts them as they're drawn)
   const afloat = useMemo(
-    () => objectsDrawn.map(({ id, things }) => ({ id, ...objectMeshes(things, objectZoom, level, true) })),
-    [objectsDrawn, objectZoom, level],
+    () => objectsDrawn.map(({ id, things }) => ({ id, ...objectMeshes(things, objectZoom, 0, true) })),
+    [objectsDrawn, objectZoom],
   )
 
   useEffect(() => {
@@ -938,232 +1158,41 @@ export default function App() {
     return () => request.abort()
   }, [pickedVessel, vesselDetail])
 
+  // The layers' data, each worked out only when what it comes from changes: a new array, even of the same things, has
+  // deck.gl lay it out and send it to the graphics again, and the effect below runs on every tide step and pan
+  const contours = useMemo(() => ({ contours: contourMode, shallow, safety, deep }), [contourMode, shallow, safety, deep])
+  const sun = useMemo(() => ({ sunLat, sunLon, lit }), [sunLat, sunLon, lit])
+  const warningSet = useMemo(() => warningShapes(show.warnings ? filteredWarnings : [], zoom), [filteredWarnings, show.warnings, zoom])
+  const lights = useMemo(
+    () =>
+      // lights shine at night only, and stay bright: they're not lit by the sun but their own. Those afloat ride the tide
+      lit
+        ? [...standing.flatMap((set) => set.lights), ...afloat.flatMap((set) => set.lights.map((l) => ({ ...l, position: [l.position[0], l.position[1], l.position[2] + level] })))].filter(
+            ({ position: [lng, lat] }) => daylightAt(lng, lat, sun) < 0.5,
+          )
+        : [],
+    [standing, afloat, lit, sun, level],
+  )
+  const trackData = useMemo(() => (vesselTrack ? [vesselTrack] : []), [vesselTrack])
+  const aheadData = useMemo(() => (vesselRoute?.path ? [vesselRoute.path] : []), [vesselRoute])
+  const routeData = useMemo(() => {
+    const waypoints = route.waypoints.map((w, i) => ({ ...w, i }))
+    const names = route.waypoints.map((w, i) => ({ position: [w.lng, w.lat], text: w.name || `WP${i + 1}`, offset: [0, -14], size: 11 }))
+    const legLabels = legsOf(route).map((leg) => ({ position: [(leg.from.lng + leg.to.lng) / 2, (leg.from.lat + leg.to.lat) / 2], text: `${trueBearing(leg.bearing)} ${leg.nm.toFixed(1)} nm`, offset: [0, 12], size: 10 }))
+    return { paths: pathsOf(route), waypoints, names, legLabels }
+  }, [route])
+  const findingData = useMemo(
+    () => [...(findings ?? []).map((f) => ({ position: f.at, color: FINDING_RGB[f.severity] })), ...planEnds.map((p) => ({ position: p, color: ROUTE_RGB }))],
+    [findings, planEnds],
+  )
+
   useEffect(() => {
-    const data = kept
-    const contours = { contours: contourMode, shallow, safety, deep }
-    const sun = { sunLat, sunLon, lit }
-    const { boxes, dots } = warningShapes(warningsDrawn, zoom)
-    warningsOnMap.current = { boxes, dots }
-    const colourOf = ({ warning }) => WARNING_CATEGORIES[warning.category]
-    const boxLayer = new PolygonLayer({
-      id: 'warning-boxes',
-      beforeId: SKYLINE.id,
-      data: boxes,
-      visible: boxes.length > 0 && !globe, // (on the globe, the dots alone: big boxes would sink into it too)
-      extruded: true,
-      wireframe: true,
-      material: false,
-      getPolygon: (box) => box.ring,
-      getElevation: (box) => box.height,
-      getFillColor: (box) => [...colourOf(box), box.warning === picked ? WARNING_FILL_PICKED : WARNING_FILL],
-      getLineColor: (box) => [...colourOf(box), WARNING_EDGE],
-      // see-through boxes mustn't hide what's behind them from each other
-      parameters: { depthWriteEnabled: false },
-    })
-    const dotLayer = new ScatterplotLayer({
-      id: 'warning-dots',
-      beforeId: SKYLINE.id,
-      data: dots,
-      visible: dots.length > 0,
-      billboard: true,
-      stroked: true,
-      radiusUnits: 'pixels',
-      lineWidthUnits: 'pixels',
-      getPosition: (dot) => dot.position,
-      getRadius: (dot) => (dot.warning === picked ? WARNING_DOT_PICKED : WARNING_DOT),
-      getFillColor: colourOf,
-      getLineColor: [255, 255, 255, 220],
-      getLineWidth: 1,
-      // on a coast, or the land's height would cut them in half
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
+    warningsOnMap.current = warningSet // (for the map's own click and hover handlers)
     vesselsOnMap.current = vesselShapes
-    const vesselLayer = modelLayer('vessels', vesselModels, level, sun, SKYLINE.id)
-    const currentLayer = new PathLayer({
-      id: 'currents',
-      beforeId: SKYLINE.id,
-      data: currentSet.lines,
-      visible: currentSet.lines.length > 0,
-      widthUnits: 'pixels',
-      getPath: (line) => line.path,
-      getWidth: 1.5,
-      getColor: (line) => line.color,
-      capRounded: true,
-      jointRounded: true,
-    })
-    const currentDots = new ScatterplotLayer({
-      id: 'current-slack',
-      beforeId: SKYLINE.id,
-      data: currentSet.dots,
-      visible: currentSet.dots.length > 0,
-      radiusUnits: 'pixels',
-      getPosition: (dot) => dot.position,
-      getRadius: 2,
-      getFillColor: (dot) => dot.color,
-    })
-    const currentLabels = new TextLayer({
-      id: 'current-labels',
-      beforeId: SKYLINE.id,
-      data: currentSet.labels,
-      visible: zoom >= CURRENT_LABELS_ZOOM && currentSet.labels.length > 0,
-      getPosition: (label) => label.position,
-      getText: (label) => label.text,
-      getSize: 10,
-      getColor: [203, 213, 225, 200],
-      getPixelOffset: [0, 12],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const objectLayers = [...standing, ...afloat].map((set, i) => modelLayer(`objects-${i < standing.length ? 'standing' : 'afloat'}-${set.id}`, set, level, sun, SKYLINE.id))
-    // lights shine at night only, and stay bright: they're not lit by the sun but their own
-    const lights = lit ? [...standing, ...afloat].flatMap((set) => set.lights).filter(({ position: [lng, lat] }) => daylightAt(lng, lat, sun) < 0.5) : []
-    const lightLayer = new ScatterplotLayer({
-      id: 'lights',
-      beforeId: SKYLINE.id,
-      data: lights,
-      visible: lights.length > 0,
-      billboard: true,
-      radiusUnits: 'pixels',
-      getPosition: (light) => light.position,
-      getRadius: LIGHT_DOT,
-      getFillColor: (light) => light.color,
-      parameters: { depthWriteEnabled: false },
-    })
-    const vesselDotLayer = new ScatterplotLayer({
-      id: 'vessel-dots',
-      beforeId: SKYLINE.id,
-      data: vesselDots,
-      visible: vesselDots.length > 0,
-      radiusUnits: 'pixels',
-      getPosition: (dot) => [dot.lng, dot.lat],
-      getRadius: VESSEL_DOT,
-      getFillColor: VESSEL_CATEGORIES[AIDS],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const trackLayer = new PathLayer({
-      id: 'vessel-track',
-      beforeId: SKYLINE.id,
-      data: vesselTrack ? [vesselTrack] : [],
-      visible: !!vesselTrack,
-      widthUnits: 'pixels',
-      getPath: (path) => path,
-      getWidth: 2,
-      getColor: [255, 255, 255, 170],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    // the predicted route ahead, in the colour of the track behind but fainter, with a mark every so many hours
-    const ahead = vesselRoute?.path ? [vesselRoute.path] : []
-    const routeLayer = new PathLayer({
-      id: 'vessel-route',
-      beforeId: SKYLINE.id,
-      data: ahead,
-      visible: ahead.length > 0,
-      widthUnits: 'pixels',
-      getPath: (path) => path,
-      getWidth: 2,
-      getColor: [103, 232, 249, 150],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const ticks = vesselRoute?.ticks ?? []
-    const tickLayer = new ScatterplotLayer({
-      id: 'vessel-route-ticks',
-      beforeId: SKYLINE.id,
-      data: ticks,
-      visible: ticks.length > 0,
-      radiusUnits: 'pixels',
-      getPosition: (tick) => tick.position,
-      getRadius: 3,
-      getFillColor: [103, 232, 249, 220],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const tickLabels = new TextLayer({
-      id: 'vessel-route-labels',
-      beforeId: SKYLINE.id,
-      data: ticks,
-      visible: ticks.length > 0,
-      getPosition: (tick) => tick.position,
-      getText: (tick) => (tick.hours % 24 ? `+${tick.hours} h` : `day ${tick.hours / 24}`),
-      getSize: 11,
-      getColor: [207, 250, 254],
-      getPixelOffset: [0, -12],
-      background: true,
-      getBackgroundColor: [15, 23, 42, 190],
-      backgroundPadding: [3, 1],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const measureLegs = new PathLayer({
-      id: 'measure-legs',
-      data: legs,
-      visible: legs.length > 0,
-      widthUnits: 'pixels',
-      getPath: (leg) => [leg.from, leg.to],
-      getWidth: 2,
-      getColor: (leg) => [...MEASURE_RGB, leg.live ? 150 : 255],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const measurePoints = new ScatterplotLayer({
-      id: 'measure-points',
-      data: measured,
-      visible: measured.length > 0,
-      radiusUnits: 'pixels',
-      lineWidthUnits: 'pixels',
-      stroked: true,
-      getPosition: (point) => point,
-      getRadius: 4,
-      getFillColor: MEASURE_RGB,
-      getLineColor: [15, 23, 42],
-      getLineWidth: 1.5,
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    const measureLabels = new TextLayer({
-      id: 'measure-labels',
-      data: legs,
-      visible: legs.length > 0,
-      getPosition: (leg) => [(leg.from[0] + leg.to[0]) / 2, (leg.from[1] + leg.to[1]) / 2],
-      getText: (leg) => `${miles(leg.nm)}  ${trueBearing(leg.bearing)}`,
-      characterSet: 'auto', // (its default letters have no degree sign)
-      getSize: 12,
-      getColor: [254, 249, 195],
-      background: true,
-      getBackgroundColor: [15, 23, 42, 210],
-      backgroundPadding: [4, 2],
-      getPixelOffset: [0, -12],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
-    // a fleet vessel's recorded track, from the Fleet tab
-    const fleetTrackLayer = new PathLayer({
-      id: 'fleet-track',
-      beforeId: SKYLINE.id,
-      data: fleetTrack?.pieces ?? [],
-      visible: !!fleetTrack,
-      widthUnits: 'pixels',
-      getPath: (piece) => piece.map(([lng, lat]) => [lng, lat]),
-      getWidth: 2,
-      getColor: [196, 181, 253, 220],
-      parameters: { depthCompare: 'always', depthWriteEnabled: false },
-    })
     overlay.current?.setProps({
-      layers: [
-        new Charts({ id: 'charts', beforeId: INLAND_WATER.id, visible: !globe, data, showing, standby, show, zoom, level, contours, sun }),
-        boxLayer,
-        dotLayer,
-        ...objectLayers,
-        lightLayer,
-        currentLayer,
-        currentDots,
-        currentLabels,
-        trackLayer,
-        routeLayer,
-        tickLayer,
-        tickLabels,
-        vesselLayer,
-        vesselDotLayer,
-        fleetTrackLayer,
-        measureLegs,
-        measurePoints,
-        measureLabels,
-      ].filter(Boolean),
+      layers: buildLayers({ data: kept, warningSet, picked, globe, vesselModels, level, sun, vesselLift, currentSet, zoom, standing, afloat, lights, vesselDots, trackData, aheadData, vesselRoute, legs, measured, routeData, route, pickedWaypoint, findings, findingData, planEnds, fleetTrack, vesselTrack, deckSet, showing, standby, show, contours }),
     })
-  }, [kept, showing, standby, show, zoom, level, contourMode, shallow, safety, deep, sunLat, sunLon, lit, filteredWarnings, picked, ready, vesselShapes, vesselModels, standing, afloat, vesselTrack, currentSet, vesselRoute, legs, measured, globe, fleetTrack])
+  }, [kept, showing, standby, show, zoom, level, contours, sun, warningSet, picked, vesselShapes, vesselModels, vesselDots, vesselLift, standing, afloat, lights, trackData, aheadData, vesselRoute, currentSet, legs, measured, globe, fleetTrack, vesselTrack, deckSet, routeData, route, pickedWaypoint, findingData])
 
   useEffect(() => {
     if (map.current?.getLayer(INLAND_WATER.id)) {
@@ -1217,7 +1246,7 @@ export default function App() {
 
   if (!ready) return <LoadingScreen sync={sync} />
 
-  const enc = shown.filter((piece) => !/^(WORLD|COAST_|SEA_)/.test(piece.id))
+  const enc = shown.filter((piece) => !notChart(piece.id))
 
   const shows = (key) => (on) => setShow({ ...show, [key]: on })
   const note = 'text-xs text-slate-400'
@@ -1478,6 +1507,29 @@ export default function App() {
       ),
     },
     {
+      id: 'routes',
+      label: 'Routes',
+      title: 'Routes',
+      icon: ICONS.routes,
+      wide: true,
+      body: (
+        <RoutesPanel
+          route={route}
+          setRoute={setRoute}
+          mode={routeMode}
+          setMode={setRouteMode}
+          planEnds={planEnds}
+          setPlanEnds={setPlanEnds}
+          findings={findings}
+          setFindings={setFindings}
+          picked={pickedWaypoint}
+          setPicked={setPickedWaypoint}
+          goTo={(center) => map.current?.easeTo({ center, zoom: Math.max(map.current.getZoom(), 11), duration: 600 })}
+          note={note}
+        />
+      ),
+    },
+    {
       id: 'tools',
       label: 'Tools',
       title: 'Tools',
@@ -1549,7 +1601,8 @@ export default function App() {
     <div className="fixed inset-0 bg-slate-950">
       <div ref={mapBox} className="h-full" />
       <SideMenu menus={menus} />
-      {ready && <WeatherCanvas map={map.current} weather={weather} land={land} hour={hourIndex} wind={show.wind} waves={show.waves} swell={show.swell} />}
+      {/* (still while the Fleet tab covers the map: nothing to animate for) */}
+      {ready && <WeatherCanvas map={map.current} weather={weather} land={land} hour={hourIndex} wind={show.wind && tab === 'map'} waves={show.waves && tab === 'map'} swell={show.swell && tab === 'map'} />}
       {/* the two views, along the top: the map, and the fleets' histories over it */}
       <div role="tablist" aria-label="Views" className="absolute top-3 right-4 z-30 flex rounded-lg border border-slate-700 bg-slate-900/95 p-0.5 text-sm shadow-xl">
         {['map', 'fleet'].map((id) => (
@@ -1587,7 +1640,7 @@ export default function App() {
       {picked && (
         <section
           aria-label={`Nav warning ${picked.id}`}
-          className="absolute top-4 right-4 flex max-h-[60%] w-80 max-w-[calc(100%-2rem)] flex-col gap-2 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 [scrollbar-color:#475569_transparent] [scrollbar-width:thin] p-4 text-sm text-slate-100 shadow-xl"
+          className="absolute top-16 right-4 flex max-h-[60%] w-80 max-w-[calc(100%-2rem)] flex-col gap-2 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 [scrollbar-color:#475569_transparent] [scrollbar-width:thin] p-4 text-sm text-slate-100 shadow-xl"
         >
           <div className="flex items-start justify-between gap-2">
             <h2 className="font-semibold">{picked.id}</h2>
@@ -1595,7 +1648,7 @@ export default function App() {
               type="button"
               aria-label="Close this warning"
               onClick={() => setPickedWarnings([])}
-              className="rounded px-1.5 text-slate-300 hover:text-cyan-300"
+              className="grid size-7 shrink-0 place-items-center rounded-md text-lg leading-none text-slate-300 hover:bg-slate-800 hover:text-cyan-300"
             >
               ×
             </button>
@@ -1640,6 +1693,7 @@ export default function App() {
           </a>
         </section>
       )}
+      {pickedBridge && <BridgeCard bridge={pickedBridge} tide={tide} hour={show.tide ? hour : 0} close={() => setPickedBridge(null)} />}
       {pickedVessel && <VesselCard vessel={pickedVessel} detail={vesselDetail} route={vesselRoute} close={() => setPickedVessel(null)} />}
       {show.tide && <TidePanel tide={tide} hour={hour} setHour={setHour} />}
       <div className="absolute right-13 bottom-10 hidden origin-bottom-right scale-[0.45] items-end gap-5 transition-transform duration-200 hover:scale-100 focus-within:scale-100 md:flex">
@@ -1674,14 +1728,15 @@ export default function App() {
           <polygon ref={footprint} fill="#67e8f9" fillOpacity="0.25" stroke="#67e8f9" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />
         </svg>
       </div>
-      <div
+      <p
         role="status"
-        className={`pointer-events-none absolute inset-0 z-20 grid place-items-center bg-slate-900/50 transition-opacity duration-150 ${
+        className={`pointer-events-none absolute bottom-4 left-4 z-20 flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-sm text-slate-200 shadow-xl transition-opacity duration-300 ${
           grey ? 'opacity-100' : 'opacity-0'
         }`}
       >
-        {grey && <p className="text-xl font-semibold text-slate-100">Loading Items</p>}
-      </div>
+        <span className="size-3 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" aria-hidden="true" />
+        {grey ? 'Loading charts' : ''}
+      </p>
     </div>
   )
 }

@@ -57,6 +57,7 @@ export function unpack(buffer) {
 
 // The tide is just one number for the shader, so scrubbing through it costs next to nothing, and there's no sheet of
 // water over everything to fight the seabed for pixels. Seabed above the water dries out; land below it gets wet.
+// What floats (buoys, vessels) is built at the water's zero and lifted by lift, so the tide moves it without a rebuild.
 const TIDE_UNIFORMS = `layout(std140) uniform tideUniforms {
   float level;
   float seabed;
@@ -70,13 +71,14 @@ const TIDE_UNIFORMS = `layout(std140) uniform tideUniforms {
   float sunLon;
   float lit;
   float behind;
+  float lift;
 } tide;`
 const tideModule = {
   name: 'tide',
   vs: TIDE_UNIFORMS,
   fs: TIDE_UNIFORMS,
   uniformTypes: Object.fromEntries(
-    'level seabed contours shallow safety deep originX originY sunLat sunLon lit behind'.split(' ').map((name) => [name, 'f32']),
+    'level seabed contours shallow safety deep originX originY sunLat sunLon lit behind lift'.split(' ').map((name) => [name, 'f32']),
   ),
 }
 
@@ -90,14 +92,15 @@ out float sunUp;
 const float RADIANS = 0.01745329;
 void main() {
   color = colors.rgb;
-  height = positions.z;
+  vec3 at = positions + vec3(0.0, 0.0, tide.lift);
+  height = at.z;
   // worked out at each corner, as a CPU can't afford this per pixel. It runs true across even a huge triangle, unlike
   // the twilight curve, which the pixels do for themselves
   float lat = (tide.originY + positions.y) * RADIANS;
   float lon = (tide.originX + positions.x - tide.sunLon) * RADIANS;
   float sun = tide.sunLat * RADIANS;
   sunUp = sin(lat) * sin(sun) + cos(lat) * cos(sun) * cos(lon);
-  gl_Position = project_position_to_clipspace(positions, vec3(0.0), vec3(0.0));
+  gl_Position = project_position_to_clipspace(at, vec3(0.0), vec3(0.0));
   // squeezed into the far end of the depth range, in order: anything a chart draws is in front of all of this, however
   // deep, so a chart overwrites the world's seabed wherever it reaches, without either being cut to fit. Behind all of
   // that goes the plain sea: from far out, a depth buffer can't tell it from the seabed by how far down it is
@@ -171,9 +174,9 @@ class Mesh extends Layer {
 
   draw() {
     const { model } = this.state
-    const { level, seabed, behind, contours, sun, coordinateOrigin } = this.props
+    const { level, seabed, behind, contours, sun, coordinateOrigin, lift = 0 } = this.props
     const [originX, originY] = coordinateOrigin
-    const tide = { level, seabed: seabed ? 1 : 0, behind, ...contours, ...sun, originX, originY }
+    const tide = { level, seabed: seabed ? 1 : 0, behind, ...contours, ...sun, originX, originY, lift }
     model.shaderInputs.setProps({ tide })
     model.draw(this.context.renderPass)
   }
@@ -223,9 +226,10 @@ function chartLayers(chart, on, show, zoom, level, contours, sun) {
   ]
 }
 
-// models of chart objects or vessels (models.js), drawn just as the charts are, so the tide and the night reach them
+// models of chart objects or vessels (models.js), drawn just as the charts are, so the tide and the night reach them;
+// lift raises the whole mesh, for what floats
 const NO_CONTOURS = { contours: 0, shallow: 0, safety: 0, deep: 0 }
-export function modelLayer(id, { mesh, origin }, level, sun, beforeId) {
+export function modelLayer(id, { mesh, origin }, level, sun, beforeId, lift = 0) {
   return (
     mesh &&
     new Mesh({
@@ -239,6 +243,7 @@ export function modelLayer(id, { mesh, origin }, level, sun, beforeId) {
       sun,
       seabed: false,
       behind: 0,
+      lift,
       coordinateSystem: COORDINATE_SYSTEM.LNGLAT_OFFSETS,
       coordinateOrigin: [...origin, 0],
     })

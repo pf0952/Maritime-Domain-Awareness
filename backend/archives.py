@@ -17,7 +17,6 @@ import datetime
 import io
 import json
 import re
-import tempfile
 import threading
 import time
 import urllib.error
@@ -133,7 +132,10 @@ def run_gfw() -> None:
         progress["gfw"]["error"] = f"Global Fishing Watch said {e.code}: {detail}"
     except (OSError, ValueError) as e:
         progress["gfw"]["error"] = f"Global Fishing Watch couldn't be reached: {e}"
-    progress["gfw"]["running"] = False
+    except Exception as e:  # (an answer cut off, or not as expected: the run ends, but says why)
+        progress["gfw"]["error"] = f"Global Fishing Watch's answer couldn't be read: {type(e).__name__}: {e}"
+    finally:
+        progress["gfw"]["running"] = False
 
 
 # The archives -------------------------------------------------------------------------------------------------------
@@ -234,22 +236,37 @@ def dk_read(path: Path, mmsis: set) -> list:
     return keep(rows, mmsis)
 
 
+DK_PART = fleet.STORE.parent / "dk.part"  # the Danish zip being read: always this one file, so a run cut off (the app
+# closed mid-download, say) leaves nothing behind but this, written over by the next
+
+
 def dk_file(key: str, mmsis: set) -> list:
     """One of the Danish zips: downloaded, read for the fleet, deleted."""
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "day.zip"
-        request = urllib.request.Request(DK_BUCKET + urllib.parse.quote(key), headers={"User-Agent": "ENC 3D"})
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as res, open(path, "wb") as out:
+    request = urllib.request.Request(DK_BUCKET + urllib.parse.quote(key), headers={"User-Agent": "ENC 3D"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as res, open(DK_PART, "wb") as out:
             while chunk := res.read(1 << 20):
                 out.write(chunk)
                 if stop.is_set():
                     return []
-        return dk_read(path, mmsis)
+        return dk_read(DK_PART, mmsis)
+    finally:
+        DK_PART.unlink(missing_ok=True)
 
 
 def run_archive(source: str, years: int) -> None:
+    progress[source] = {"running": True, "done": 0, "total": 0, "kept": 0, "day": None, "error": None}
+    try:
+        read_archive(source, years)
+    except Exception as e:  # (its list of files couldn't be had, say: the run ends, but says why)
+        progress[source]["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        progress[source]["running"] = False
+
+
+def read_archive(source: str, years: int) -> None:
     """Day by day through the last so many years of an archive for the fleets' vessels, newest first, so that a run
-    stopped part way has the most recent history. Days already read for that same set of vessels are skipped; adding
+    stopped part way has the most recent history. A day already read for these vessels (or more) is skipped; adding
     vessels later means a fresh pass for the new set."""
     mmsis = set(fleet.tracked())
     key = json.dumps(sorted(mmsis))
@@ -262,9 +279,10 @@ def run_archive(source: str, years: int) -> None:
         start = (datetime.date.today() - datetime.timedelta(days=365 * years)).isoformat()[:7]
         files = sorted((stamp, k) for stamp, k in listed.items() if stamp[:7] >= start)
     files.reverse()
-    progress[source] = {"running": True, "done": 0, "total": len(files), "kept": 0, "day": None, "error": None}
+    progress[source]["total"] = len(files)
     with fleet.db() as c:
-        read = {d for (d,) in c.execute("SELECT day FROM archive_days WHERE source = ? AND mmsis = ?", (source, key))}
+        read = {d for d, done in c.execute("SELECT day, mmsis FROM archive_days WHERE source = ?", (source,))
+                if mmsis <= set(json.loads(done))}
     for stamp, what in files:
         if stop.is_set():
             break
@@ -275,9 +293,9 @@ def run_archive(source: str, years: int) -> None:
                 try:
                     rows = us_day(what, mmsis) if source == "us" else dk_file(what, mmsis)
                     break
-                except (OSError, ValueError, zipfile.BadZipFile, KeyError) as e:
+                except Exception as e:  # (cut off mid-download, a truncated or bad file: tried again, then let be)
                     if attempt == 2:
-                        progress[source]["error"] = f"{stamp}: {e}"
+                        progress[source]["error"] = f"{stamp}: {type(e).__name__}: {e}"
                     else:
                         time.sleep(10)
             if rows is None:
@@ -289,7 +307,6 @@ def run_archive(source: str, years: int) -> None:
                 c.execute("INSERT OR IGNORE INTO archive_days VALUES (?, ?, ?)", (source, stamp, key))
             progress[source]["kept"] += len(rows)
         progress[source]["done"] += 1
-    progress[source]["running"] = False
 
 
 def start(source: str, years: int = 1) -> bool:

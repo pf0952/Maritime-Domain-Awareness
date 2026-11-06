@@ -1,5 +1,6 @@
 // Simple models of what the charts mark, and of vessels, from a few solids: flat shaded, in muted real colours. Each set
 // is built into one mesh, for meshes.js to draw like the charts, with the tide and the night on it too
+import { LAND_TOP, metresPerPixel } from './geo'
 import { VESSEL_CATEGORIES, vesselCategory } from './vessels'
 
 export const OBJECTS_ZOOM = 14 // further out, a chart's objects would be a clutter of specks
@@ -7,7 +8,6 @@ const OBJECT_PX = 6 // tall on screen at the least: true to scale, a buoy would 
 const VESSEL_DETAIL_PX = 40 // long on screen: shorter, a vessel is its hull, deck in its type's colour, and superstructure
 const SIDES = 12 // around a round thing: even stripes in twos, threes and fours
 const METRES = 111320 // to a degree of latitude
-const LAND_TOP = 15 // m: backend/charts.py's LAND_HEIGHT
 const SUN = normalise([-0.4, 0.5, 0.77]) // from the north-west, high up, as maps are lit
 // S-57's colours, as paint rather than signal
 const COLOURS = {
@@ -440,9 +440,33 @@ const FLOATS = new Set(['buoy', 'lightship', 'lightfloat', 'pontoon'])
 const HAZARDS = new Set(['wreck', 'rock', 'obstruction'])
 const floats = (t) => FLOATS.has(t.kind) || (t.kind === 'mooring' && t.shape === 7)
 const spot = ([lng, lat]) => `${lng.toFixed(5)} ${lat.toFixed(5)}`
-const metresPerPixel = (lat, zoom) => (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
 // a steady turn for things the chart gives no heading, so that wrecks and rocks don't all lie the same way
 const turnOf = ([lng, lat]) => Math.abs(Math.round(lng * 1e5) * 7 + Math.round(lat * 1e5) * 13) % 360
+
+const BRIDGE_DECK = 2.5 // m thick
+const BRIDGE_UNCHARTED = LAND_TOP - 2 // m up, for a piece of bridge the chart gives no clearance for
+// how high a bridge's underside is, above chart datum: US charts give clearances above Mean High Water
+const bridgeUnder = (t, mhw) => (t.clearance != null ? mhw + t.clearance : BRIDGE_UNCHARTED)
+
+// The piece of bridge under a point on screen, if any, tested against its deck where it's drawn, high above the water:
+// project turns [lng, lat, metres up] into screen pixels
+export function bridgeAt(sets, project, x, y, mhw, claimed = new Set()) {
+  for (const { things } of sets) {
+    for (const t of things) {
+      if (t.kind !== 'bridge' || claimed.has(t)) continue
+      const z = bridgeUnder(t, mhw) + BRIDGE_DECK
+      const screen = []
+      for (let i = 0; i < t.xy.length; i += 2) screen.push(project([t.xy[i], t.xy[i + 1], z]))
+      for (let i = 0; i < t.triangles.length; i += 3) {
+        const [a, b, c] = t.triangles.slice(i, i + 3).map((k) => screen[k])
+        const side = (p, q) => (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0])
+        const [ab, bc, ca] = [side(a, b), side(b, c), side(c, a)]
+        if ((ab >= 0 && bc >= 0 && ca >= 0) || (ab <= 0 && bc <= 0 && ca <= 0)) return t
+      }
+    }
+  }
+  return null
+}
 
 // an area of bridge or pontoon, from the chart's triangles: its top, and its edges stood up from z0
 function slab(p, s, z0, z1, rgb, origin) {
@@ -468,7 +492,7 @@ function slab(p, s, z0, z1, rgb, origin) {
 
 // A chart's objects, those afloat (which go up and down with the tide) or those that aren't, as one mesh, and its
 // lights. A topmark or light goes on top of whatever stands at its spot
-export function objectMeshes(things, zoom, level, afloat) {
+export function objectMeshes(things, zoom, level, afloat, mhw = 0, claimed = new Set()) {
   const p = new Parts()
   const first = things.find((t) => t.at)?.at ?? things[0]?.xy ?? [0, 0]
   const origin = [Math.round(first[0] * 100) / 100, Math.round(first[1] * 100) / 100]
@@ -480,9 +504,10 @@ export function objectMeshes(things, zoom, level, afloat) {
     if (floats(t) !== afloat || t.kind === 'topmark' || t.kind === 'light') continue
     if (t.xy) {
       if (t.kind === 'bridge') {
-        // (no lower than the land, which is only ever a slab this high, or its ends would be buried)
-        const under = Math.max(t.clearance ?? 10, LAND_TOP - 2)
-        slab(p, t, under, under + 2.5, CONCRETE, origin)
+        if (claimed.has(t)) continue // (drawn along the street map's line instead: bridgeDecks)
+        // (true to its clearance, though its ends then dip into the land, which is only ever a slab this high)
+        const under = bridgeUnder(t, mhw)
+        slab(p, t, under, under + BRIDGE_DECK, CONCRETE, origin)
       } else slab(p, t, level - 0.5, level + 0.7, [128, 126, 118], origin)
       continue
     }
@@ -790,4 +815,188 @@ function vesselModel(p, type, long, wide, band) {
     forecastle(p, long, wide, high, [92, 98, 106])
     house(p, long, wide, high)
   }
+}
+
+// Bridges as the street map has them: each road or railway marked as a bridge, near one the chart marks, becomes a deck
+// along its real line. Over a charted span it stands at that span's clearance; off it, it slopes towards the land's top
+// at a road's grade, so it meets the shore. Piers stand along it, but not under a span the chart gives a clearance for
+const BRIDGE_NEAR = 60 // m: a road bridge this near a charted one is part of it
+const BRIDGE_BESIDE = 25 // m: a charted piece this near a deck is drawn by it, not as a slab of its own
+const BRIDGE_STEP = 10 // m between the heights worked out along a deck
+const BRIDGE_GRADE = 0.05 // rise in a metre along an approach
+const PIER_EVERY = 45 // m
+const PIER_FOOT = -8 // m: below the water, as no depth is to hand here
+const PARAPET = 1 // m high
+const ROAD_WIDTH = { highway: 12, major_road: 10, minor_road: 7, path: 3, rail: 5 } // m, by the street map's kind
+const DECK_TOP_ON_LAND = LAND_TOP + 0.3 // where a deck meets the land
+const PIER_RGB = [126, 124, 118]
+
+const ringsOf = (t) => {
+  const rings = []
+  let start = 0
+  for (const n of t.rings) {
+    const ring = []
+    for (let i = start; i < start + n; i++) ring.push([t.xy[2 * i], t.xy[2 * i + 1]])
+    rings.push(ring)
+    start += n
+  }
+  return rings
+}
+
+function inside(rings, [x, y]) {
+  let odd = false
+  for (const ring of rings) {
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = ring[i]
+      const [xj, yj] = ring[j]
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) odd = !odd
+    }
+  }
+  return odd
+}
+
+// m from a point to a ring's edges, measured flat around the point
+function metresTo(rings, [lng, lat]) {
+  const across = METRES * Math.cos((lat * Math.PI) / 180)
+  let best = Infinity
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length; i++) {
+      const [ax, ay] = [(ring[i][0] - lng) * across, (ring[i][1] - lat) * METRES]
+      const [bx, by] = [(ring[(i + 1) % ring.length][0] - lng) * across, (ring[(i + 1) % ring.length][1] - lat) * METRES]
+      const [dx, dy] = [bx - ax, by - ay]
+      const t = Math.max(0, Math.min(1, -(ax * dx + ay * dy) / (dx * dx + dy * dy || 1)))
+      best = Math.min(best, Math.hypot(ax + t * dx, ay + t * dy))
+    }
+  }
+  return best
+}
+
+// a line split into points no further apart than BRIDGE_STEP, with how far along each is (m)
+function densify(line) {
+  const points = [line[0]]
+  const along = [0]
+  for (let i = 1; i < line.length; i++) {
+    const [[x0, y0], [x1, y1]] = [line[i - 1], line[i]]
+    const across = METRES * Math.cos((y0 * Math.PI) / 180)
+    const length = Math.hypot((x1 - x0) * across, (y1 - y0) * METRES)
+    const steps = Math.max(1, Math.ceil(length / BRIDGE_STEP))
+    for (let k = 1; k <= steps; k++) {
+      points.push([x0 + ((x1 - x0) * k) / steps, y0 + ((y1 - y0) * k) / steps])
+      along.push(along.at(-1) + length / steps)
+    }
+  }
+  return { points, along }
+}
+
+// lines: the street map's bridges, as { coords, kind, cut: whether each end is where its tile cut it short }; sets: the charts' objects. The decks' mesh, the pieces of
+// charted bridge they stand for (whose slabs are then left out), and each stretch of deck's top, for clicks
+export function bridgeDecks(lines, sets, mhw) {
+  const pieces = sets.flatMap(({ things }) => things.filter((t) => t.kind === 'bridge')).map((t) => {
+    const xs = t.xy.filter((_, i) => i % 2 === 0)
+    const ys = t.xy.filter((_, i) => i % 2 === 1)
+    const pad = BRIDGE_NEAR / METRES
+    return { t, rings: ringsOf(t), box: [Math.min(...xs) - pad * 2, Math.min(...ys) - pad, Math.max(...xs) + pad * 2, Math.max(...ys) + pad] }
+  })
+  const p = new Parts()
+  const claimed = new Set()
+  const decks = []
+  const first = lines[0]?.coords[0] ?? [0, 0]
+  const origin = [Math.round(first[0] * 100) / 100, Math.round(first[1] * 100) / 100]
+  for (const { coords, kind, cut = [false, false] } of lines) {
+    const width = ROAD_WIDTH[kind]
+    if (!width || coords.length < 2 || !pieces.length) continue
+    const { points, along } = densify(coords)
+    // the charted piece each point is over, or the nearest within reach
+    const over = points.map((pt) => {
+      let near = null
+      let nearest = BRIDGE_NEAR
+      for (const piece of pieces) {
+        const [w, s, e, n] = piece.box
+        if (pt[0] < w || pt[0] > e || pt[1] < s || pt[1] > n) continue
+        if (inside(piece.rings, pt)) return { piece, within: true, away: 0 }
+        const d = metresTo(piece.rings, pt)
+        if (d < nearest) [near, nearest] = [piece, d]
+      }
+      return near && { piece: near, within: false, away: nearest }
+    })
+    if (!over.some(Boolean)) continue // a bridge over a road or a dry valley, not over the water
+    for (const o of over) if (o && o.away < BRIDGE_BESIDE) claimed.add(o.piece.t)
+    // the deck's top: set over a span with a clearance, and at the land's top at the bridge's real ends. Between two
+    // such, it runs straight from one to the other; past the last, where the tile cut it short, it slopes at a road's
+    // grade towards the land's top
+    const set = over.map((o) => (o?.within && o.piece.t.clearance != null ? bridgeUnder(o.piece.t, mhw) + BRIDGE_DECK : null))
+    const last = points.length - 1
+    if (set[0] == null && !cut[0]) set[0] = DECK_TOP_ON_LAND
+    if (set[last] == null && !cut[1]) set[last] = DECK_TOP_ON_LAND
+    const towardsLand = (h, metres) => {
+      const run = metres * BRIDGE_GRADE
+      return h > DECK_TOP_ON_LAND ? Math.max(DECK_TOP_ON_LAND, h - run) : Math.min(DECK_TOP_ON_LAND, h + run)
+    }
+    const top = set.slice()
+    let before = -1
+    for (let i = 0; i <= last; i++) {
+      if (set[i] != null) {
+        before = i
+        continue
+      }
+      let after = i + 1
+      while (after <= last && set[after] == null) after++
+      if (before >= 0 && after <= last) {
+        const f = (along[i] - along[before]) / (along[after] - along[before])
+        top[i] = set[before] + (set[after] - set[before]) * f
+      } else if (before >= 0) top[i] = towardsLand(set[before], along[i] - along[before])
+      else if (after <= last) top[i] = towardsLand(set[after], along[after] - along[i])
+      else top[i] = DECK_TOP_ON_LAND
+    }
+    // which charted piece a click on each stretch tells of: the one it's over, or else the nearest
+    const anyPiece = over.find(Boolean).piece.t
+    const tells = over.map((o) => o?.piece.t ?? anyPiece)
+    const [lng0, lat0] = points[0]
+    const across = METRES * Math.cos((lat0 * Math.PI) / 180)
+    const local = ([lng, lat]) => [(lng - lng0) * across, (lat - lat0) * METRES]
+    const unlocal = ([x, y]) => [lng0 + x / across, lat0 + y / METRES]
+    p.place(lng0 - origin[0], lat0 - origin[1], 0, lat0)
+    let nextPier = PIER_EVERY / 2
+    for (let i = 1; i < points.length; i++) {
+      const [a, b] = [local(points[i - 1]), local(points[i])]
+      const [dx, dy] = [b[0] - a[0], b[1] - a[1]]
+      const length = Math.hypot(dx, dy) || 1
+      const [sx, sy] = [(-dy / length) * (width / 2), (dx / length) * (width / 2)] // to the left
+      const [za, zb] = [top[i - 1], top[i]]
+      const [al, ar] = [[a[0] + sx, a[1] + sy], [a[0] - sx, a[1] - sy]]
+      const [bl, br] = [[b[0] + sx, b[1] + sy], [b[0] - sx, b[1] - sy]]
+      const [ua, ub] = [za - BRIDGE_DECK, zb - BRIDGE_DECK]
+      p.quad([...ar, za], [...br, zb], [...bl, zb], [...al, za], CONCRETE) // top
+      p.quad([...al, ua], [...bl, ub], [...br, ub], [...ar, ua], CONCRETE) // underside
+      p.quad([...ar, ua], [...br, ub], [...br, zb + PARAPET], [...ar, za + PARAPET], CONCRETE) // right side, up to its parapet
+      p.quad([...bl, ub], [...al, ua], [...al, za + PARAPET], [...bl, zb + PARAPET], CONCRETE) // left
+      decks.push({ corners: [[...unlocal(ar), za], [...unlocal(br), zb], [...unlocal(bl), zb], [...unlocal(al), za]], t: tells[i] })
+      // piers, but none in a span the chart gives a clearance for: that's the channel
+      while (nextPier <= along[i]) {
+        const f = (nextPier - along[i - 1]) / (along[i] - along[i - 1] || 1)
+        const o = f < 0.5 ? over[i - 1] : over[i]
+        const channel = o?.within && o.piece.t.charted != null
+        const under = za + (zb - za) * f - BRIDGE_DECK
+        if (!channel && under > PIER_FOOT + 1) {
+          const [lng, lat] = unlocal([a[0] + dx * f, a[1] + dy * f])
+          p.place(lng - origin[0], lat - origin[1], PIER_FOOT, lat, 1, (Math.atan2(dx, dy) * 180) / Math.PI)
+          p.box(0, 0, 0, width * 0.7, 2.5, under - PIER_FOOT, PIER_RGB)
+          p.place(lng0 - origin[0], lat0 - origin[1], 0, lat0)
+        }
+        nextPier += PIER_EVERY
+      }
+    }
+  }
+  return { mesh: p.mesh(), origin, claimed, decks }
+}
+
+// the stretch of deck under a point on screen, if any: the charted piece of bridge it tells of
+export function deckAt(decks, project, x, y) {
+  for (const { corners, t } of decks) {
+    const s = corners.map(project)
+    const side = (p, q) => (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0])
+    const turns = s.map((p, i) => side(p, s[(i + 1) % 4]))
+    if (turns.every((v) => v >= 0) || turns.every((v) => v <= 0)) return t
+  }
+  return null
 }

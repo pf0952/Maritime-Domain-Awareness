@@ -1,5 +1,5 @@
 // Nav warnings: their categories and ages for the filters, their shapes to draw, and which are under a click
-import { inRing } from './geo'
+import { inRing, metresPerPixel } from './geo'
 
 export const WARNING_FILL = 28 // of 255: very see-through
 export const WARNING_FILL_PICKED = 80
@@ -29,7 +29,7 @@ export const ROMAN = 'I II III IV V VI VII VIII IX X XI XII XIII XIV XV XVI XVII
 
 // warnings as what to draw: an area is a box its true size on the map, and anything with no size of its own is a dot
 export function warningShapes(warnings, zoom) {
-  const metresPerPixel = (lat) => (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
+  const perPixel = (lat) => metresPerPixel(lat, zoom)
   const boxes = []
   const dots = []
   for (const warning of warnings) {
@@ -44,7 +44,7 @@ export function warningShapes(warnings, zoom) {
       const east = Math.max(...lons)
       const south = Math.min(...lats)
       const north = Math.max(...lats)
-      const scale = metresPerPixel((south + north) / 2)
+      const scale = perPixel((south + north) / 2)
       boxes.push({ warning, ring, height: Math.max(150, WARNING_HEIGHT * scale) })
       const degreesPerPixel = (scale / 40075016) * 360
       if ((north - south) / degreesPerPixel < WARNING_DOT_BELOW && (east - west) / degreesPerPixel < WARNING_DOT_BELOW) {

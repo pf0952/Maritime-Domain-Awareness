@@ -11,6 +11,7 @@ at its word. What it would have printed goes to enc/server.log.
 
   python backend/launch.py [--no-window] [--port N] [--stay]   (--stay: run on with no window open)"""
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -27,6 +28,8 @@ EDGE = [Path(os.environ.get(v, ""), r"Microsoft\Edge\Application\msedge.exe") fo
 LOG = Path(__file__).parent.parent / "enc" / "server.log"
 ALIVE = 10  # s: how often an open window says so (frontend/src/App.jsx)
 GRACE = 8  # s after a goodbye, for a refresh to say hello again
+LOG_MOST = 5_000_000  # bytes: a bigger log is set aside when the app starts
+SHUTDOWN = 5  # s for requests still running to finish, once stopping
 QUIET = 45  # s with no word from any window: it was closed without a goodbye, or the computer slept
 
 
@@ -76,7 +79,11 @@ def main() -> None:
     asked = int(args[args.index("--port") + 1]) if "--port" in args else None
     if sys.stdout is None:  # (started with no console: pythonw)
         LOG.parent.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > LOG_MOST:  # (the last one kept, the rest let go)
+            LOG.replace(LOG.with_suffix(".old.log"))
         sys.stdout = sys.stderr = open(LOG, "a", encoding="utf-8", buffering=1)
+    # the server's own messages, with when: a thread that failed in the night says so with its time
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     running = next((p for p in ([asked] if asked else PORTS) if ours(p)), None)
     if running:
         print(f"ENC 3D is already running, on port {running}", flush=True)
@@ -100,11 +107,15 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     import main as server_app
 
-    server = uvicorn.Server(uvicorn.Config(server_app.app, host="127.0.0.1", port=port, log_config=None))
+    # (a request still running when the last window goes, from a window that was killed say, would hold the shutdown up
+    # for ever: it's given a few seconds)
+    server = uvicorn.Server(uvicorn.Config(server_app.app, host="127.0.0.1", port=port, log_config=None,
+                                           timeout_graceful_shutdown=SHUTDOWN))
     if "--stay" not in args:
         threading.Thread(target=watch, args=(server_app.windows, server), daemon=True).start()
     server.run()
     print("Stopped", flush=True)
+    os._exit(0)  # (and gone, whatever's left: a chart download's worker processes, a thread mid-request)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 // AIS vessels from Open Waters: which tiles to read, their categories, and their hulls as shapes to draw and click
-import { tileAt } from './geo'
+import { metresPerPixel, tileAt } from './geo'
 
 export const VESSEL_FOUND_ZOOM = 13 // a vessel found by search is shown at this zoom
 export const VESSELS_FOUND = 8 // listed at most, of those a search finds
@@ -10,8 +10,7 @@ const VESSEL_TILE_LOWEST = 3 // its tiles thin out ships at random below this, b
 const VESSEL_ALL_ZOOM = 8 // further out, tiles of ship types that run big only, or they're thinned to mostly small craft
 const VESSEL_BIG_TYPES = '?type=60-89'
 const VESSEL_MIN_LENGTH = [[4, 200], [6, 100], [8, 50], [10, 20]] // below this zoom, only vessels this long, in m
-const VESSEL_LENGTH_PX = [7, 16] // true to scale, unless smaller on screen than this, from all the way out to the charts' zooms
-const VESSEL_BEAM = 0.5 // of the above: a ship true to scale would be nothing from far out
+const VESSEL_UNKNOWN_LENGTH = 15 // m, for a vessel that doesn't report its size
 const VESSEL_SLIM = 6 // length to beam, for a vessel that doesn't report its beam
 const VESSEL_REACH = 12 // px: how near a click counts
 export const VESSEL_DOT = 3 // px, for beacons, shore stations and gear: they have no heading or size to draw
@@ -67,7 +66,7 @@ export function vesselTiles(m) {
   }
 }
 
-// where to draw a vessel and how big (models.js draws it): true length and beam, unless too small on screen to see
+// where to draw a vessel and how big (models.js draws it): true length and beam, however small that is on screen
 export function vesselShape(vessel, zoom, level, middle) {
   // its position is its GPS aerial's, which can be well aft or off to one side: the hull's middle is from that
   const { to_bow: bow, to_stern: stern, to_port: port, to_starboard: starboard } = vessel
@@ -77,17 +76,15 @@ export function vesselShape(vessel, zoom, level, middle) {
   const across = 111320 * Math.cos((vessel.lat * Math.PI) / 180)
   const lat = vessel.lat + (ahead * Math.cos(turn) - aside * Math.sin(turn)) / 111320
   const lng = vessel.lng + (ahead * Math.sin(turn) + aside * Math.cos(turn)) / across + 360 * Math.round((middle - vessel.lng) / 360)
-  const metresPerPixel = (40075016 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom)
-  const [smallest, largest] = VESSEL_LENGTH_PX
-  const least = (smallest + ((largest - smallest) * Math.min(zoom, VESSEL_ALL_ZOOM)) / VESSEL_ALL_ZOOM) * metresPerPixel
-  const length = Math.max(vessel.length || 0, least)
+  const perPixel = metresPerPixel(lat, zoom)
+  const length = vessel.length || VESSEL_UNKNOWN_LENGTH
   return {
     vessel,
     centre: [lng, lat],
     level,
     length,
-    beam: Math.max(vessel.beam || (vessel.length || 0) / VESSEL_SLIM, least * VESSEL_BEAM),
-    reach: Math.max(VESSEL_REACH, length / 2 / metresPerPixel),
+    beam: vessel.beam || length / VESSEL_SLIM,
+    reach: Math.max(VESSEL_REACH, length / 2 / perPixel),
   }
 }
 

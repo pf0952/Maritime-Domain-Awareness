@@ -1,5 +1,6 @@
 // Wind and waves (backend/weather.py) as streaks moving over the map: a canvas of its own on top, so animating them
 // never makes the map itself draw again, which would cost a CPU every frame
+import { metresPerPixel } from './geo'
 import { useEffect, useRef } from 'react'
 
 const FPS = 30
@@ -91,10 +92,11 @@ export function WeatherCanvas({ map, weather, land, hour, wind, waves, swell }) 
     let frame = null
     let last = 0
 
+    // (setting a canvas's size, even to the same, throws its pixels away and makes it anew)
     const size = () => {
       for (const each of [c, waveCanvas.current]) {
-        each.width = c.clientWidth
-        each.height = c.clientHeight
+        if (each.width !== c.clientWidth) each.width = c.clientWidth
+        if (each.height !== c.clientHeight) each.height = c.clientHeight
       }
     }
     const somewhere = () => {
@@ -118,7 +120,7 @@ export function WeatherCanvas({ map, weather, land, hour, wind, waves, swell }) 
 
     // a step of so many px on screen, towards a bearing, from a point
     const moved = (p, towards, px) => {
-      const metres = px * (40075016 * Math.cos((p.lat * Math.PI) / 180)) / (512 * 2 ** map.getZoom())
+      const metres = px * metresPerPixel(p.lat, map.getZoom())
       const t = (towards * Math.PI) / 180
       return { lng: p.lng + (metres * Math.sin(t)) / across(p.lat), lat: p.lat + (metres * Math.cos(t)) / 111320 }
     }

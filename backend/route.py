@@ -84,8 +84,6 @@ def ports() -> tuple:
     return by_code, by_name
 
 
-
-
 def destination(text: str) -> dict | None:
     """The port a destination means. The last leg of "JP NGO>JP HKT"; a code with or without its gap or dash; or a name."""
     said = (text or "").upper().split(">")[-1].strip()

@@ -54,3 +54,9 @@
 .cube-face[data-face='w'] {
   transform: rotateY(-90deg) translateZ(var(--half)) rotateZ(90deg);
 }
+
+/* keyboard focus, the same everywhere: a clear ring, where a border's change of colour is easy to miss */
+:where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid rgb(103 232 249);
+  outline-offset: 1px;
+}

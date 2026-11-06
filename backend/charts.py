@@ -11,6 +11,7 @@ import functools
 import gzip
 import json
 import os
+import threading
 import struct
 from pathlib import Path
 
@@ -417,7 +418,7 @@ def compile_cell(path: Path, hole: shapely.Geometry | None = None) -> bytes:
     return pack(name, scale, bounds, meshes, centred=max(bounds[2] - bounds[0], bounds[3] - bounds[1]) <= WIDE)
 
 
-OBJECT_FORMAT = 1  # the same, for a chart's objects
+OBJECT_FORMAT = 3  # the same, for a chart's objects
 # what the viewer draws a model of, by object class; areas stand at a point in the middle, with their size
 OBJECT_LAYERS = {
     **dict.fromkeys(("BOYLAT", "BOYCAR", "BOYISD", "BOYSAW", "BOYSPP", "BOYINB"), "buoy"),
@@ -431,6 +432,33 @@ SHAPE_FIELDS = {"buoy": "BOYSHP", "beacon": "BCNSHP", "topmark": "TOPSHP", "land
 SLAB_LAYERS = {"BRIDGE": ("bridge", 8), "PONTON": ("pontoon", 3), "FLODOC": ("pontoon", 3)}  # m wide, when a line
 OBJECT_NUMBERS = ("HEIGHT", "VERCLR", "VALSOU", "WATLEV", "COLPAT")
 OBJECT_GROUND = 10  # m deep, for something in the water where the chart gives no depth band
+BRIDGE_GAP = 0.0004  # degrees, about 40 m: pieces of bridge this close are one deck
+BRIDGE_KINDS = {1: "fixed", 2: "opening", 3: "swing", 4: "lift", 5: "bascule", 6: "pontoon", 7: "draw",
+                8: "transporter", 9: "footbridge", 10: "viaduct", 11: "aqueduct", 12: "suspension"}  # CATBRG
+
+
+def number(row: dict, field: str) -> float | None:
+    v = row.get(field)
+    return float(v) if isinstance(v, (int, float)) and not np.isnan(v) else None
+
+
+def bridge_clearances(shapes: np.ndarray, rows: list) -> list:
+    """Each piece of bridge's clearance under it (m above MHW on US charts), closed if it opens. The chart gives one
+    only for the spans over the channel: a piece without one takes the highest of the pieces it touches (or
+    nearly: a lift span's towers can stand between), a few steps out, as the deck runs on from the span to its
+    approaches."""
+    clear = [number(r, "VERCLR") if number(r, "VERCLR") is not None else number(r, "VERCCL") for r in rows]
+    touching = shapely.STRtree(shapes).query(shapes, predicate="dwithin", distance=BRIDGE_GAP)
+    for _ in range(4):
+        known = {}
+        for a, b in zip(*touching):
+            if clear[a] is None and clear[b] is not None:
+                known[a] = max(known.get(a, clear[b]), clear[b])
+        if not known:
+            break
+        for a, c in known.items():
+            clear[a] = c
+    return clear
 
 
 def numbers(value) -> list:
@@ -469,8 +497,18 @@ def chart_objects(path: Path, hole: shapely.Geometry | None = None) -> list:
             lines = shapely.get_type_id(shapes) == shapely.GeometryType.LINESTRING
             if lines.any():
                 shapes[lines] = widen(shapes[lines], width)
-            clearances = rows["VERCLR"] if "VERCLR" in rows else pd.Series(np.nan, index=rows.index)
-            for shape, clearance in zip(shapes, clearances):
+            records = rows.to_dict("records")
+            clearances = bridge_clearances(shapes, records) if kind == "bridge" else [None] * len(records)
+            for shape, clearance, row in zip(shapes, clearances, records):
+                about = {}
+                if kind == "bridge":
+                    about = {k: v for k, v in {
+                        "name": row.get("OBJNAM") if isinstance(row.get("OBJNAM"), str) else None,
+                        "type": BRIDGE_KINDS.get((numbers(row.get("CATBRG")) or [0])[0]),
+                        "charted": number(row, "VERCLR") if number(row, "VERCLR") is not None else number(row, "VERCCL"),
+                        "open": number(row, "VERCOP"),
+                        "wide": number(row, "HORCLR"),
+                    }.items() if v is not None}
                 # (outer rings anticlockwise and holes clockwise, so the viewer can tell which way their sides face)
                 for part in shapely.orient_polygons(only_polygons(np.array([shape]))):
                     xy, triangles = earcut(part)
@@ -479,7 +517,8 @@ def chart_objects(path: Path, hole: shapely.Geometry | None = None) -> list:
                         "xy": xy.round(7).ravel().tolist(),
                         "triangles": triangles.tolist(),
                         "rings": [len(shapely.get_coordinates(r)) - 1 for r in shapely.get_rings(part)],
-                        "clearance": None if np.isnan(clearance) else float(clearance),
+                        "clearance": clearance,
+                        **about,
                     })
             continue
         kind = OBJECT_LAYERS[layer]
@@ -517,7 +556,7 @@ def compile_objects(path: Path, hole_wkb: bytes | None, out: Path) -> None:
 def save(data: bytes, out: Path) -> None:
     """Writes to the cache. The whole file appears at once, or none of it."""
     out.parent.mkdir(exist_ok=True)
-    fresh = out.with_suffix(f".{os.getpid()}")
+    fresh = out.with_suffix(f".{os.getpid()}-{threading.get_ident()}")  # (two threads can compile the same chart)
     fresh.write_bytes(gzip.compress(data, 6))
     fresh.replace(out)
 

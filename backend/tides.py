@@ -2,6 +2,7 @@
 
 Heights are above chart datum (MLLW, or Low Water Datum on the Great Lakes), the same zero as the charts' depths, so
 they can be set against them directly. Lakes have no tides to predict: they stay at their last reading."""
+import http.client
 import json
 import math
 import time
@@ -14,6 +15,7 @@ import numpy as np
 
 STATIONS_URL = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type="
 DATA_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+DATUMS_URL = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/{}/datums.json?units=metric"
 SAVED = Path(__file__).parent.parent / "enc" / "tide_stations.json"
 HOURS = 120  # either side of now
 LIVE_REACH = 50  # km: a station with a live gauge is worth preferring this far out
@@ -27,9 +29,14 @@ stations_loaded = []
 
 
 def fetch_json(url: str) -> dict:
+    """A URL's JSON. Any way the fetch can fail comes out as OSError (or ValueError, for an answer that isn't JSON):
+    an answer cut off part way is http.client's own kind of error otherwise, which callers wouldn't expect."""
     request = urllib.request.Request(url, headers={"User-Agent": "ENC 3D"})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as res:
-        return json.load(res)
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as res:
+            return json.load(res)
+    except http.client.HTTPException as e:
+        raise OSError(f"{type(e).__name__}: {e}") from e
 
 
 def stations() -> list:
@@ -88,6 +95,22 @@ def readings(product: str, station: dict, begin: float, end: float) -> tuple:
     return times, np.array([float(r["v"]) for r in rows])
 
 
+def mean_high_water(station: dict, levels: np.ndarray) -> tuple:
+    """MHW above chart datum, the zero US charts give bridge clearances from, and where it came from. The station's
+    own tidal datums if NOAA has them; else the mean of the highs in the hours to hand, a fair guess. On the Great
+    Lakes clearances are from Low Water Datum, the same zero as the levels."""
+    if station.get("greatlakes"):
+        return 0.0, "Low Water Datum"
+    try:
+        datums = {d["name"]: d["value"] for d in fetch_json(DATUMS_URL.format(station["id"])).get("datums") or []}
+        if datums.get("MHW") is not None and datums.get("MLLW") is not None:
+            return round(datums["MHW"] - datums["MLLW"], 3), "station datums"
+    except (OSError, ValueError):
+        pass
+    highs = levels[1:-1][(levels[1:-1] > levels[:-2]) & (levels[1:-1] >= levels[2:])]
+    return (round(float(highs.mean()), 3), "estimated from the predicted highs") if len(highs) else (None, None)
+
+
 def series(station: dict) -> dict:
     """A height for each hour from HOURS before now to HOURS after, and whether it was measured."""
     cached = series_cache.get(station["id"])
@@ -119,5 +142,6 @@ def series(station: dict) -> dict:
         "predicted": bool(len(predicted)),
         "datum": "Low Water Datum" if station.get("greatlakes") else "MLLW",
     }
+    result["mhw"], result["mhw_from"] = mean_high_water(station, levels)
     series_cache[station["id"]] = (now + FRESH, result)
     return result

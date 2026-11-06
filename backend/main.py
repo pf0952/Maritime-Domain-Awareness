@@ -5,6 +5,7 @@ backend/.venv/Scripts/python -m uvicorn main:app --app-dir backend
 It also serves the built viewer (frontend/dist), so that's the whole app, at http://127.0.0.1:8000. start.bat runs it
 through launch.py instead, which finds a free port and opens it in a window of its own."""
 import json
+import re
 import tempfile
 import threading
 import time
@@ -17,6 +18,7 @@ import numpy as np
 import shapely
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pyogrio.errors import DataLayerError, DataSourceError
@@ -28,6 +30,7 @@ import currents
 import fleet
 import navwarnings
 import route
+import routes
 import sync
 import tides
 import weather
@@ -49,6 +52,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ENC 3D", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+# only asked for by name as this computer: a web page elsewhere that had its own name pointed here (DNS rebinding)
+# would pass the same-site check, as its Origin and Host would match
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "*.localhost"])
 
 
 def upload_summary(chart: sync.Chart) -> dict:
@@ -135,11 +141,14 @@ def get_view(west: float, south: float, east: float, north: float, tier: int, co
         raise HTTPException(422, "corners must be lng,lat pairs, four or more")
     in_sight = sync.on_the_map(shapely.make_valid(screen))
     land = [(name, tier, sync.land_file(name, tier, catalog)) for name in sync.land_view(area, zoom, catalog)]
-    picked = [(c.name, tier, sync.chart_file(c, tier, catalog)) for c in reversed(catalog.pick(area, tier))]
-    covered = shapely.union_all([c.cover for c in catalog.pick(area, tier)])
+    chosen = catalog.pick(area, tier)
+    picked = [(c.name, tier, sync.chart_file(c, tier, catalog)) for c in reversed(chosen)]
+    covered = shapely.union_all([c.cover for c in chosen])
     # last, as charts hide it and hidden costs less, and none at all of what they hide completely
     sea = [(name, 0, sync.sea_file(name)) for name in sync.sea_view(area, zoom, covered)]
-    pieces = [{"name": name, "tier": t, "key": file.stem} for name, t, file in land + picked + sea]
+    # (objects: the key for its objects, which change with the way they're worked out as well as with the chart)
+    pieces = [{"name": name, "tier": t, "key": file.stem, "objects": f"{file.stem}-{charts.OBJECT_FORMAT}"}
+              for name, t, file in land + picked + sea]
     detailed = []
     if zoom >= sync.BUILDINGS_ZOOM:  # (from further out it's thousands of charts, for no buildings to stand)
         charts_here = catalog.over(in_sight)
@@ -230,6 +239,56 @@ def put_fleet(name: str, mmsis: list[int] = Body(..., max_length=fleet.MOST)):
     return fleet.fleets()
 
 
+@app.get("/api/routes")
+def get_routes():
+    """The routes kept, by name."""
+    return routes.load()
+
+
+@app.put("/api/routes/{name}", dependencies=[Depends(same_site)])
+def put_route(name: str, route_: dict = Body(...)):
+    if not name.strip() or len(name) > 120:
+        raise HTTPException(422, "A route needs a name, of 120 characters at most")
+    if len(route_.get("waypoints") or []) > 500:
+        raise HTTPException(422, "A route can have 500 waypoints at most")
+    return routes.save(name.strip(), route_)
+
+
+@app.delete("/api/routes/{name}", dependencies=[Depends(same_site)])
+def delete_route(name: str):
+    return routes.delete(name)
+
+
+@app.post("/api/routes/plan", dependencies=[Depends(same_site)])
+def post_route_plan(start: list[float] = Body(..., min_length=2, max_length=2), end: list[float] = Body(..., min_length=2, max_length=2),
+                    vessel: dict = Body(default={}), xtd: float = Body(default=routes.XTD, gt=0, le=5)):
+    """A first route between two points, through water deep enough for the vessel: a start to edit, not a passage plan."""
+    try:
+        return routes.plan(start, end, vessel, xtd)
+    except UNREADABLE:
+        raise HTTPException(503, "A chart along the way can't be read just now")
+
+
+@app.post("/api/routes/check", dependencies=[Depends(same_site)])
+def post_route_check(route_: dict = Body(...)):
+    """What each leg runs into, from the charts and the tides."""
+    waypoints = route_.get("waypoints")
+    if not isinstance(waypoints, list) or len(waypoints) > 500 or not all(
+            isinstance(w, dict) and isinstance(w.get("lng"), (int, float)) and isinstance(w.get("lat"), (int, float))
+            and abs(w["lat"]) <= 90 for w in waypoints):
+        raise HTTPException(422, "A route's waypoints need a lng and lat each, 500 at most")
+    try:
+        xtd = float(route_.get("xtd") or routes.XTD)
+    except (TypeError, ValueError):
+        xtd = -1
+    if not 0 < xtd <= 5:
+        raise HTTPException(422, "The cross-track distance has to be over 0 and at most 5 nm")
+    try:
+        return routes.check(route_)
+    except UNREADABLE:
+        raise HTTPException(503, "A chart along the way can't be read just now")
+
+
 @app.delete("/api/fleets/{name}", dependencies=[Depends(same_site)])
 def delete_fleet(name: str):
     fleet.delete_fleet(name)
@@ -311,6 +370,8 @@ def get_outline():
 def get_chart(name: str, tier: int):
     catalog = sync.catalog
     if name.startswith("SEA_"):
+        if not re.fullmatch(r"SEA_\d+_\d+_\d+", name):  # (a name, before it goes into a path)
+            raise HTTPException(404, f"No tile {name}")
         path = sync.sea_file(name)
         if not path.exists():
             try:
