@@ -1,24 +1,21 @@
-// The Vessel tab: "My vessel", read from her documents (backend/vessel_docs.py). Her capacity plan gives her
-// particulars and compartments, her stow plan the cargo, and her stability report the condition's figures, as the
-// ship's own approved software printed them. Nothing here works out stability: it shows the documents' figures in 3D
-// and hands them to the motions along a route.
+// The Vessel tab: "Own vessel", read from her documents (backend/vessel_docs.py). The ship, read once: her capacity
+// plan (hull lines, particulars, deck heights) and GA. Her loading conditions, each from a stability report (drafts,
+// trim, list, GM, as the ship's own approved software printed them) and a stow or load plan, one of them current.
+// Nothing here works out stability: the hull is shown floating in the current condition, moving in a sea.
 //
 // Frame: x m from the aft perpendicular (+ forward), y m from the centreline (+ starboard), z m above the baseline.
-import { COORDINATE_SYSTEM, Deck, OrbitView } from '@deck.gl/core'
-import { SolidPolygonLayer } from '@deck.gl/layers'
-import { useEffect, useRef, useState } from 'react'
+import { COORDINATE_SYSTEM, Deck, Layer, OrbitView, project32 } from '@deck.gl/core'
+import { PathLayer, SolidPolygonLayer } from '@deck.gl/layers'
+import { Geometry, Model } from '@luma.gl/engine'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
-const KIND_RGB = { Hold: [148, 163, 184], Ballast: [56, 189, 248], Fuel: [244, 114, 182], 'Fresh water': [125, 211, 252], Other: [167, 139, 250] }
-const CARGO_RGB = [217, 119, 6]
 const DEFAULT_UNIT = [6.1, 2.44, 2.59] // m, a block with no size given: a twenty-foot box
 const FIGURES = [
   ['displacement', 'Displacement', 't'], ['deadweight', 'Deadweight', 't'], ['draught_aft', 'Draught aft', 'm'], ['draught_mid', 'Draught mid', 'm'],
   ['draught_fwd', 'Draught fwd', 'm'], ['trim', 'Trim', 'm'], ['list', 'List', '°'], ['gm', 'GM, corrected', 'm'], ['kg', 'KG, corrected', 'm'],
   ['km', 'KM', 'm'], ['lcg', 'LCG', 'm'], ['tcg', 'TCG', 'm'], ['roll_period', 'Roll period', 's'], ['air_draught', 'Air draught', 'm'],
 ]
-const CAPACITY_COLUMNS = [['', '—'], ['capacity', 'Capacity, m³'], ['lcg', 'LCG'], ['tcg', 'TCG'], ['vcg', 'VCG']]
 const STOW_COLUMNS = [['', '—'], ['weight', 'Weight, t'], ['lcg', 'LCG'], ['tcg', 'TCG'], ['vcg', 'VCG'], ['l', 'Length, m'], ['b', 'Breadth, m'], ['h', 'Height, m']]
-const EMPTY = { name: '', principal: { lbp: '', loa: '', breadth: '', depth: '' }, decks: {}, report: { figures: {}, source: {}, items: [] }, compartments: [], stow: [], documents: {} }
 // a deck as the stow plan names it given the capacity plan's height for it ("Tween" is the "Tween deck"; the weather
 // deck, the main deck), where it has none of its own yet
 const deckKey = (name) => name.toLowerCase().replace('weather', 'main').replace(/[^a-z0-9]/g, '').replace(/deck$/, '')
@@ -50,105 +47,380 @@ export const rowsOf = (text) =>
 // a length as the document gives it, measured from the aft perpendicular
 const fromAp = (v, ref, lbp) => (ref === 'mid_fwd' ? lbp / 2 + v : ref === 'mid_aft' ? lbp / 2 - v : v)
 
-// --- the 3D view: her hull as a box with a bow, the waterline at the report's drafts, compartments and cargo as blocks
+// --- the 3D view: her hull, solid, floating at the stability report's drafts, trim and list, and moving in the sea
+// set in the Sea state panel (the waves drawn about her, her roll, pitch and heave from the motions estimate)
 
-function block(x, y, z, [l, b, h]) {
-  return { polygon: [[x - l / 2, y - b / 2, z], [x + l / 2, y - b / 2, z], [x + l / 2, y + b / 2, z], [x - l / 2, y + b / 2, z]], h }
+const SUN = [-0.4, 0.5, 0.77]
+const HULL_RGB = [176, 184, 196]
+const SEA_RGB = [12, 52, 82]
+const FRAME_MS = 50 // ms between frames drawn: 20 a second, light enough for software rendering
+const LIVE_MS = 250 // ms between the live readouts' updates
+const CREASE = Math.cos((35 * Math.PI) / 180) // faces meeting more sharply than this keep the edge between them crisp
+// a mesh's triangles, shaded smooth over its curves and crisp at its corners: each corner of a face lit by the
+// average facing of the faces round that point that meet it at less than the crease angle. As arrays for the
+// graphics chip: { attributes, indices }
+function solidMesh(mesh, rgb) {
+  if (!mesh?.points?.length) return null
+  const p = mesh.points
+  const t = mesh.triangles
+  const nf = t.length / 3
+  // each face's normal (its winding may run either way: facing is taken both ways)
+  const normals = new Float64Array(nf * 3)
+  for (let f = 0; f < nf; f++) {
+    const [i, j, k] = [t[3 * f], t[3 * f + 1], t[3 * f + 2]]
+    const u = [p[3 * j] - p[3 * i], p[3 * j + 1] - p[3 * i + 1], p[3 * j + 2] - p[3 * i + 2]]
+    const v = [p[3 * k] - p[3 * i], p[3 * k + 1] - p[3 * i + 1], p[3 * k + 2] - p[3 * i + 2]]
+    const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+    const len = Math.hypot(...n) || 1
+    normals.set([n[0] / len, n[1] / len, n[2] / len], 3 * f)
+  }
+  // the faces round each point (points at the same place counted as one)
+  const id = new Map()
+  const at = (i) => {
+    const key = `${p[3 * i].toFixed(2)},${p[3 * i + 1].toFixed(2)},${p[3 * i + 2].toFixed(2)}`
+    if (!id.has(key)) id.set(key, id.size)
+    return id.get(key)
+  }
+  const ids = Array.from({ length: p.length / 3 }, (_, i) => at(i))
+  const round = Array.from({ length: id.size }, () => [])
+  for (let f = 0; f < nf; f++) for (let c = 0; c < 3; c++) round[ids[t[3 * f + c]]].push(f)
+  const positions = new Float32Array(t.length * 3)
+  const colors = new Uint8Array(t.length * 4)
+  for (let f = 0; f < nf; f++) {
+    const n0 = [normals[3 * f], normals[3 * f + 1], normals[3 * f + 2]]
+    for (let c = 0; c < 3; c++) {
+      const i = t[3 * f + c]
+      const sum = [0, 0, 0]
+      for (const g of round[ids[i]]) {
+        const d = n0[0] * normals[3 * g] + n0[1] * normals[3 * g + 1] + n0[2] * normals[3 * g + 2]
+        if (Math.abs(d) < CREASE) continue // (across a corner: not blended)
+        const s = d < 0 ? -1 : 1
+        sum[0] += s * normals[3 * g]
+        sum[1] += s * normals[3 * g + 1]
+        sum[2] += s * normals[3 * g + 2]
+      }
+      const len = Math.hypot(...sum) || 1
+      const light = 0.42 + 0.58 * Math.abs((sum[0] * SUN[0] + sum[1] * SUN[1] + sum[2] * SUN[2]) / len)
+      positions.set([p[3 * i], p[3 * i + 1], p[3 * i + 2]], (3 * f + c) * 3)
+      colors.set([...rgb.map((x) => Math.round(x * light)), 255], (3 * f + c) * 4)
+    }
+  }
+  return {
+    attributes: { positions: { value: positions, size: 3 }, colors: { value: colors, size: 4, normalized: true } },
+    indices: { value: Uint32Array.from({ length: t.length }, (_, i) => i), size: 1 },
+  }
 }
 
-function VesselView({ vessel }) {
+const MESH_VS = `#version 300 es
+in vec3 positions;
+in vec4 colors;
+out vec4 color;
+void main() {
+  color = colors;
+  gl_Position = project_position_to_clipspace(positions, vec3(0.0), vec3(0.0));
+}`
+const MESH_FS = `#version 300 es
+precision highp float;
+in vec4 color;
+out vec4 fragColor;
+void main() { fragColor = color; }`
+
+// a solid mesh, colours baked in, moved by its modelMatrix (her pose each frame costs only that)
+class SolidMesh extends Layer {
+  initializeState() {}
+
+  updateState({ props, oldProps }) {
+    if (props.mesh === oldProps.mesh) return
+    this.state.model?.destroy()
+    this.state.model = props.mesh && new Model(this.context.device, {
+      ...this.getShaders({ vs: MESH_VS, fs: MESH_FS, modules: [project32] }),
+      id: props.id,
+      geometry: new Geometry({ topology: 'triangle-list', ...props.mesh }),
+      bufferLayout: this.getAttributeManager().getBufferLayouts(),
+      parameters: { depthWriteEnabled: true, depthCompare: 'less-equal', cullMode: 'none' },
+    })
+  }
+
+  draw() {
+    this.state.model?.draw(this.context.renderPass)
+  }
+
+  finalizeState(context) {
+    super.finalizeState(context)
+    this.state.model?.destroy()
+  }
+}
+SolidMesh.layerName = 'SolidMesh'
+
+// column-major 4×4 matrices, as deck.gl takes them
+const mul = (a, b) => {
+  const o = new Array(16).fill(0)
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) for (let k = 0; k < 4; k++) o[c * 4 + r] += a[k * 4 + r] * b[c * 4 + k]
+  return o
+}
+const move = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]
+const aboutY = (t) => [Math.cos(t), 0, -Math.sin(t), 0, 0, 1, 0, 0, Math.sin(t), 0, Math.cos(t), 0, 0, 0, 0, 1] // (+ bow up)
+const aboutX = (t) => [1, 0, 0, 0, 0, Math.cos(t), -Math.sin(t), 0, 0, Math.sin(t), Math.cos(t), 0, 0, 0, 0, 1] // (+ starboard down)
+
+// where she floats: the waterline amidships at the sea's level, trimmed and listed as the report gives her, then
+// heaved, pitched and rolled
+function pose(vessel, mid, heave = 0, pitch = 0, roll = 0) {
+  const f = vessel.report.figures
+  const lbp = vessel.principal.lbp
+  const aft = f.draught_aft ?? f.draught_mid ?? 0
+  const fwd = f.draught_fwd ?? f.draught_mid ?? aft
+  const draught = f.draught_mid ?? (aft + fwd) / 2
+  const trim = Math.atan2(aft - fwd, lbp) // (+ by the stern: her bow up)
+  const list = ((f.list ?? 0) * Math.PI) / 180
+  return [move(mid, 0, heave), aboutY(trim + pitch), aboutX(list + roll), move(-mid, 0, -draught)].reduce(mul)
+}
+
+// her motions and the sea's surface at a time, from the waves the server split the sea into, each with a phase
+function motionAt(waves, t) {
+  let heave = 0
+  let pitch = 0
+  let roll = 0
+  for (const w of waves) {
+    const a = w.phase - w.omega_e * t
+    const mu = (w.mu * Math.PI) / 180
+    heave += w.heave * Math.cos(a)
+    pitch += w.pitch * Math.sin(a) * Math.sign(Math.cos(mu) || 1)
+    roll += w.roll * Math.sin(a) * Math.sign(Math.sin(mu) || 1)
+  }
+  return { heave, pitch, roll }
+}
+const surface = (waves, x, y, t) => waves.reduce((z, w) => z + w.amp * Math.cos(w.k * (x * w.cx + y * w.sy) - w.omega_e * t + w.phase), 0)
+
+function VesselView({ vessel, sea, active, onLive }) {
   const box = useRef(null)
   const deck = useRef(null)
   const { lbp, breadth: beam } = vessel.principal
   const depth = vessel.principal.depth || beam * 0.6
+  const [aft, fore] = useMemo(() => {
+    const xs = vessel.hull?.points?.filter((_, i) => i % 3 === 0)
+    return xs?.length ? [Math.min(...xs), Math.max(...xs)] : [0, lbp]
+  }, [vessel])
+  const mid = lbp / 2
+  // her hull as read off the capacity plan, solid; else a box of her particulars
+  const hull = useMemo(() => solidMesh(vessel.hull, HULL_RGB), [vessel])
+  const blockHull = useMemo(() => [{ polygon: [[0, -beam / 2, 0], [lbp * 0.85, -beam / 2, 0], [lbp, 0, 0], [lbp * 0.85, beam / 2, 0], [0, beam / 2, 0]] }], [vessel])
+  // the waves with phases of their own (random, as a sea's are), relative to her
+  const waves = useMemo(
+    () => (sea?.components ?? []).map((w) => ({ ...w, phase: Math.random() * 2 * Math.PI, cx: Math.cos((w.mu * Math.PI) / 180), sy: Math.sin((w.mu * Math.PI) / 180) })),
+    [sea],
+  )
   useEffect(() => {
     const width = box.current.clientWidth || 800
     deck.current = new Deck({
       parent: box.current,
       views: new OrbitView({ orbitAxis: 'Z', fovy: 35 }),
-      initialViewState: { target: [lbp / 2, 0, depth / 2], rotationOrbit: -35, rotationX: 22, zoom: Math.log2(width / (lbp * 1.35)), minZoom: -4, maxZoom: 6 },
+      initialViewState: { target: [(aft + fore) / 2, 0, 2], rotationOrbit: -35, rotationX: 18, zoom: Math.log2(width / ((fore - aft) * 1.5)), minZoom: -4, maxZoom: 6 },
       controller: true,
-      getTooltip: ({ object }) => object?.tip && { text: object.tip, style: { background: '#0f172a', color: '#e2e8f0', fontSize: '12px', borderRadius: '6px' } },
     })
     return () => deck.current?.finalize()
   }, [vessel])
   useEffect(() => {
-    const f = vessel.report.figures
-    const aft = f.draught_aft ?? f.draught_mid
-    const fwd = f.draught_fwd ?? f.draught_mid
-    const at = (x) => aft + ((fwd - aft) * x) / lbp
-    const r = ((f.list ?? 0) * Math.PI) / 180 // (+ to starboard, as the report gives it: drawn so)
-    const [c, s] = [Math.cos(r), Math.sin(r)]
-    const pz = f.draught_mid ?? aft ?? 0
-    const modelMatrix = [1, 0, 0, 0, 0, c, -s, 0, 0, s, c, 0, 0, -pz * s, pz - pz * c, 1]
-    const common = { coordinateSystem: COORDINATE_SYSTEM.CARTESIAN, modelMatrix, extruded: true, getPolygon: (d) => d.polygon, getElevation: (d) => d.h, pickable: true }
-    const hull = [{ polygon: [[0, -beam / 2, 0], [lbp * 0.85, -beam / 2, 0], [lbp, 0, 0], [lbp * 0.85, beam / 2, 0], [0, beam / 2, 0]], h: depth }]
-    const compartments = vessel.compartments
-      .filter((k) => k.lcg != null && k.vcg != null)
-      .map((k) => {
-        const side = Math.min(Math.max(Math.cbrt(k.capacity || k.volume || 1), 1.5), beam / 2, 14)
-        return { ...block(k.lcg, k.tcg ?? 0, k.vcg - side / 2, [side, side, side]), rgb: KIND_RGB[k.kind] ?? KIND_RGB.Other, tip: `${k.name} (${k.kind})\n${fmt(k.capacity, 0)} m³` }
+    const span = [aft - 70, fore + 70]
+    const reach = Math.max(70, beam * 3)
+    const draw = (t) => {
+      const m = waves.length ? motionAt(waves, t) : { heave: 0, pitch: 0, roll: 0 }
+      const lines = []
+      if (waves.length) {
+        for (let y = -reach; y <= reach; y += 10) {
+          const path = []
+          for (let x = span[0]; x <= span[1]; x += 4) path.push([x, y, surface(waves, x - mid, y, t)])
+          lines.push(path)
+        }
+        for (let x = span[0]; x <= span[1]; x += 15) {
+          const path = []
+          for (let y = -reach; y <= reach; y += 4) path.push([x, y, surface(waves, x - mid, y, t)])
+          lines.push(path)
+        }
+      }
+      deck.current?.setProps({
+        layers: [
+          new SolidPolygonLayer({
+            id: 'sea',
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            data: [{ polygon: [[span[0], -reach, 0], [span[1], -reach, 0], [span[1], reach, 0], [span[0], reach, 0]] }],
+            getPolygon: (d) => d.polygon,
+            getFillColor: [...SEA_RGB, 235],
+          }),
+          hull
+            ? new SolidMesh({ id: 'hull', coordinateSystem: COORDINATE_SYSTEM.CARTESIAN, modelMatrix: pose(vessel, mid, m.heave, m.pitch, m.roll), mesh: hull })
+            : new SolidPolygonLayer({
+                id: 'hull-box',
+                coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+                modelMatrix: pose(vessel, mid, m.heave, m.pitch, m.roll),
+                data: blockHull,
+                extruded: true,
+                getElevation: depth,
+                getPolygon: (d) => d.polygon,
+                getFillColor: HULL_RGB,
+              }),
+          new PathLayer({
+            id: 'waves',
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            data: lines,
+            getPath: (d) => d,
+            getColor: [148, 197, 230, 150],
+            getWidth: 1,
+            widthUnits: 'pixels',
+          }),
+        ],
       })
-    const cargo = vessel.stow
-      .filter((u) => u.lcg != null && u.vcg != null && u.tcg != null)
-      .map((u) => {
-        const size = u.size ?? DEFAULT_UNIT
-        return { ...block(u.lcg, u.tcg ?? 0, u.vcg - size[2] / 2, size), tip: `${u.name || 'Cargo'}\n${fmt(u.weight, 1)} t` }
-      })
-    deck.current?.setProps({
-      layers: [
-        new SolidPolygonLayer({
-          id: 'water',
-          coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-          data: aft != null ? [{ polygon: [[-15, -beam, at(-15)], [lbp + 25, -beam, at(lbp + 25)], [lbp + 25, beam, at(lbp + 25)], [-15, beam, at(-15)]] }] : [],
-          getPolygon: (d) => d.polygon,
-          getFillColor: [14, 116, 144, 90],
-          parameters: { depthWriteEnabled: false },
-        }),
-        new SolidPolygonLayer({ id: 'compartments', ...common, data: compartments, getFillColor: (d) => [...d.rgb, 110], parameters: { depthWriteEnabled: false } }),
-        new SolidPolygonLayer({ id: 'cargo', ...common, data: cargo, getFillColor: [...CARGO_RGB, 220] }),
-        new SolidPolygonLayer({ id: 'hull', ...common, pickable: false, data: hull, getFillColor: [148, 163, 184, 45], parameters: { depthWriteEnabled: false } }),
-      ],
-    })
-  }, [vessel])
-  return <div ref={box} className="relative h-full min-h-80 w-full" aria-label="3D view of the vessel. Drag to rotate, scroll to zoom, hover over a block for its name." />
+      return m
+    }
+    if (!active || !waves.length) {
+      draw(0)
+      return
+    }
+    let frame
+    let last = 0
+    let told = 0
+    const start = performance.now()
+    const tick = (now) => {
+      frame = requestAnimationFrame(tick)
+      if (now - last < FRAME_MS) return
+      last = now
+      const m = draw((now - start) / 1000)
+      if (now - told > LIVE_MS) {
+        told = now
+        onLive?.({ roll: (m.roll * 180) / Math.PI, pitch: (m.pitch * 180) / Math.PI, heave: m.heave })
+      }
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  }, [vessel, waves, active, hull])
+  return <div ref={box} className="relative h-full min-h-80 w-full" aria-label="3D view of the vessel in the sea. Drag to rotate, scroll to zoom." />
+}
+
+// the sea she's in: the forecast now at a place (the map's centre, say), or one set by hand; her heading and speed
+function SeaPanel({ vessel, sea, setSea, live }) {
+  const [where, setWhere] = useState(() => {
+    const c = window.mdaMapCentre?.()
+    return c ? { lat: +c.lat.toFixed(3), lng: +c.lng.toFixed(3) } : { lat: '', lng: '' }
+  })
+  const [heading, setHeading] = useState(0)
+  const [speed, setSpeed] = useState(12)
+  const [manual, setManual] = useState(false)
+  const [set, setSet] = useState({ hs: 2.5, period: 8, from: 0 })
+  const [state, setState] = useState('')
+  const asked = useRef(0)
+  const ask = async () => {
+    const mine = ++asked.current
+    setState('Loading sea state…')
+    const body = { heading: +heading, speed: +speed, ...(manual ? { sea: [[+set.hs, +set.period, +set.from]] } : { lat: +where.lat, lng: +where.lng }) }
+    const res = await fetch(`/api/vessels/${vessel.id}/sea`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null)
+    const answer = res ? await res.json().catch(() => ({})) : { detail: 'Server could not be reached.' }
+    if (mine !== asked.current) return // (a later request's answer counts, not this one)
+    if (!res?.ok) return setState(answer.detail ?? 'Sea state could not be loaded.')
+    setState('')
+    setSea(answer)
+  }
+  useEffect(() => {
+    if (manual || (where.lat !== '' && where.lng !== '')) ask()
+  }, [vessel.id])
+  const num = (label, value, change, props = {}) => (
+    <label className="flex flex-col gap-0.5 text-slate-400">
+      {label}
+      <input type="number" step="any" value={value} onChange={(e) => change(e.target.value)} className={input} {...props} />
+    </label>
+  )
+  const f = sea?.forecast
+  const m = sea?.motion
+  return (
+    <section aria-label="Sea state" className="flex flex-col gap-2 text-sm">
+      <h2 className="font-medium">Sea state</h2>
+      <div className="flex gap-3 text-xs">
+        <label className="flex items-center gap-1"><input type="radio" checked={!manual} onChange={() => setManual(false)} /> Forecast now</label>
+        <label className="flex items-center gap-1"><input type="radio" checked={manual} onChange={() => setManual(true)} /> Set manually</label>
+      </div>
+      <div className="grid grid-cols-2 gap-1.5 text-xs">
+        {manual ? (
+          <>
+            {num('Wave height Hs, m', set.hs, (x) => setSet({ ...set, hs: x }), { min: 0, max: 20 })}
+            {num('Period, s', set.period, (x) => setSet({ ...set, period: x }), { min: 2, max: 25 })}
+            {num('From, °T', set.from, (x) => setSet({ ...set, from: x }), { min: 0, max: 360 })}
+          </>
+        ) : (
+          <>
+            {num('Latitude', where.lat, (x) => setWhere({ ...where, lat: x }))}
+            {num('Longitude', where.lng, (x) => setWhere({ ...where, lng: x }))}
+            <button type="button" className={`${button} col-span-2`} onClick={() => { const c = window.mdaMapCentre?.(); if (c) setWhere({ lat: +c.lat.toFixed(3), lng: +c.lng.toFixed(3) }) }}>
+              Use map centre
+            </button>
+          </>
+        )}
+        {num('Heading, °T', heading, setHeading, { min: 0, max: 360 })}
+        {num('Speed, kn', speed, setSpeed, { min: 0, max: 30 })}
+      </div>
+      <button type="button" className={button} onClick={ask}>Apply</button>
+      {state && <p className="text-xs text-amber-200">{state}</p>}
+      {sea && (
+        <dl className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5 text-xs tabular-nums">
+          {f && (
+            <>
+              <dt className="text-slate-400">Waves (total)</dt>
+              <dd className="text-right">{fmt(f.wave, 1)} m, {fmt(f.period, 1)} s, from {fmt(f.waveFrom, 0)}°</dd>
+              {f.swell != null && (
+                <>
+                  <dt className="text-slate-400">Swell</dt>
+                  <dd className="text-right">{fmt(f.swell, 1)} m, {fmt(f.swellPeriod, 1)} s, from {fmt(f.swellFrom, 0)}°</dd>
+                </>
+              )}
+              {f.wind != null && (
+                <>
+                  <dt className="text-slate-400">Wind</dt>
+                  <dd className="text-right">{fmt(f.wind, 0)} kn from {fmt(f.windFrom, 0)}°</dd>
+                </>
+              )}
+            </>
+          )}
+          <dt className="text-slate-400">Roll, significant</dt>
+          <dd className="text-right">{fmt(m.roll, 1)}°</dd>
+          <dt className="text-slate-400">Pitch, significant</dt>
+          <dd className="text-right">{fmt(m.pitch, 1)}°</dd>
+          <dt className="text-slate-400">Heave, significant</dt>
+          <dd className="text-right">{fmt(m.heave, 2)} m</dd>
+          <dt className="text-slate-400">Roll period</dt>
+          <dd className="text-right">{fmt(m.roll_period, 1)} s</dd>
+          {live && (
+            <>
+              <dt className="text-slate-400">Now: roll / pitch / heave</dt>
+              <dd className="text-right">{fmt(live.roll, 1)}° / {fmt(live.pitch, 1)}° / {fmt(live.heave, 2)} m</dd>
+            </>
+          )}
+        </dl>
+      )}
+      {m?.warnings?.map((w) => (
+        <p key={w} className="text-xs text-amber-200">⚠ {w}</p>
+      ))}
+      <p className="text-xs text-slate-500">Motions estimated from the report's GM and roll period and the sea state, not from vessel seakeeping data. Planning aid only. Not for navigation.</p>
+    </section>
+  )
 }
 
 // --- reading the documents
 
-// a PDF's pages, one at a time, with a button to send the page's text on
-function Pages({ label, kind, onPages, send }) {
-  const [pages, setPages] = useState([])
+// a document read: what was found (or why not), and its pages one at a time, with a button to send a page's text on
+function Pages({ doc, send }) {
   const [page, setPage] = useState(0)
-  const [state, setState] = useState('')
-  const read = async (e) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setState(kind === 'capacity' ? 'Reading PDF… Drawn plans are read by OCR and may take 1–2 minutes.' : 'Reading PDF…')
-    const body = new FormData()
-    body.append('file', file)
-    const res = await fetch(`/api/vessels/pdf?kind=${kind}`, { method: 'POST', body }).catch(() => null)
-    const answer = res ? await res.json() : { detail: 'Server could not be reached.' }
-    if (!res?.ok) return setState(answer.detail)
-    setPages(answer.pages)
-    setPage(0)
-    setState(
-      answer.drawn_only
-        ? answer.capacity?.words
-          ? `Text is drawn as vector lines (CAD export). ${answer.capacity.words} words read by OCR; check the results below.`
-          : (answer.problem ?? 'This PDF has no text layer (vector drawing or scan). Enter the required figures below.')
-        : (answer.problem ?? ''),
-    )
-    onPages(file.name, answer)
-  }
+  const a = doc?.answer
+  if (!doc) return <p className="text-slate-500">Not loaded. Add it above.</p>
+  if (doc.reading) return <p className="text-cyan-200">Reading {doc.name}…</p>
+  if (doc.error) return <p className="text-amber-200">{doc.name}: {doc.error}</p>
+  const pages = a.pages ?? []
+  const note = a.drawn_only
+    ? a.capacity?.words
+      ? `Text is drawn as vector lines (CAD export). ${a.capacity.words} words read by OCR; check the results below.`
+      : (a.problem ?? 'This PDF has no text layer (vector drawing or scan). Enter the required figures below.')
+    : (a.problem ?? '')
   return (
     <div className="flex flex-col gap-1">
-      <label className="flex flex-col gap-1 text-slate-400">
-        {label}
-        <input type="file" accept=".pdf" onChange={read} className="text-slate-300" />
-      </label>
-      {state && <p className="text-amber-200">{state}</p>}
-      {pages.length > 0 && (
+      <p className="text-slate-400">{doc.name}</p>
+      {note && <p className="text-amber-200">{note}</p>}
+      {pages.some((t) => t.trim()) && (
         <>
           <div className="flex items-center gap-2 text-slate-400">
             <label>
@@ -165,6 +437,72 @@ function Pages({ label, kind, onPages, send }) {
         </>
       )}
     </div>
+  )
+}
+
+// the documents dropped or chosen, all at once: each read in the background (the map can be used meanwhile), what it
+// was taken for (changeable), how long it's taking
+const READ_TIME = { capacity: 'about 3 min if drawn (text by OCR, then hull lines traced)', ga: 'about 2 min if drawn (text by OCR)', report: 'a few seconds', stow: 'a few seconds' }
+function Uploads({ queue, add, retake, now, scope }) {
+  const [over, setOver] = useState(false)
+  const pick = useRef(null)
+  const reading = queue.filter((q) => q.reading)
+  return (
+    <section aria-label="Documents to read" className="flex flex-col gap-2">
+      <button
+        type="button"
+        onClick={() => pick.current?.click()}
+        onDragOver={(e) => {
+          e.preventDefault()
+          setOver(true)
+        }}
+        onDragLeave={() => setOver(false)}
+        onDrop={(e) => {
+          e.preventDefault()
+          setOver(false)
+          add([...e.dataTransfer.files].filter((f) => /\.pdf$/i.test(f.name)))
+        }}
+        className={`flex flex-col items-center gap-1 rounded-lg border-2 border-dashed px-3 py-4 text-center ${over ? 'border-cyan-400 bg-cyan-400/10' : 'border-slate-700 hover:border-slate-500'}`}
+      >
+        <span className="font-medium text-slate-200">Drop PDFs here or click to select</span>
+        <span className="text-slate-400">{scope === 'ship' ? 'Capacity plan and general arrangement (GA)' : 'Stability report and stow or load plan'}, together or one at a time. Each is identified automatically.</span>
+      </button>
+      <input ref={pick} type="file" accept=".pdf" multiple className="hidden" aria-label="Vessel documents (PDF)" onChange={(e) => { add([...e.target.files]); e.target.value = '' }} />
+      {queue.length > 0 && (
+        <ul className="flex flex-col gap-1">
+          {queue.map((q) => (
+            <li key={q.id} className="flex items-center gap-2 rounded border border-slate-800 px-2 py-1">
+              {q.reading ? (
+                <span className="size-3 shrink-0 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" aria-hidden="true" />
+              ) : (
+                <span className={`shrink-0 ${q.error ? 'text-amber-300' : 'text-emerald-300'}`} aria-hidden="true">{q.error ? '!' : '✓'}</span>
+              )}
+              <span className="min-w-0 flex-1 truncate" title={q.name}>{q.name}</span>
+              {q.reading ? (
+                <span className="shrink-0 tabular-nums text-slate-400">{Math.round((now - q.started) / 1000)} s</span>
+              ) : q.error ? (
+                <span className="shrink-0 text-amber-200" title={q.error}>Failed</span>
+              ) : (
+                <select value={q.kind} onChange={(e) => retake(q, e.target.value)} className={`shrink-0 bg-slate-950 ${q.wrong ? 'text-amber-200' : ''}`} aria-label={`${q.name}: document type`}
+                  title={q.wrong ? `A ${KIND_LABEL[q.kind]?.toLowerCase()}: add it to ${OTHER_PLACE[scope]} instead` : undefined}>
+                  {Object.entries(KIND_LABEL).map(([k, label]) => (
+                    <option key={k} value={k} disabled={q.drawn && !['capacity', 'ga'].includes(k)}>{label}</option>
+                  ))}
+                </select>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {queue.filter((q) => q.wrong).map((q) => (
+        <p key={q.id} className="text-amber-200">{q.name} reads as a {KIND_LABEL[q.kind]?.toLowerCase()}: not used here. Add it to {OTHER_PLACE[scope]}.</p>
+      ))}
+      {reading.length > 0 && (
+        <p className="text-cyan-200">
+          Reading {reading.length} document{reading.length > 1 ? 's' : ''}: {READ_TIME[reading[0].kind] ?? 'up to 3 min if a drawn plan is read (text by OCR, then hull lines traced)'}. The map and other tabs can be used meanwhile.
+        </p>
+      )}
+    </section>
   )
 }
 
@@ -300,23 +638,146 @@ function StowList({ v, setV }) {
   )
 }
 
-function Builder({ start, saved, cancel }) {
+// what a document read holds, for any field still empty: the ship's name and particulars, the decks' heights, a
+// tank table. (The condition's figures come from the stability report only, the units from the stow plan only.)
+const DOC_NAMES = { capacity: 'capacity plan', ga: 'general arrangement', report: 'stability report', stow: 'stow plan' }
+const blank = (x) => x === '' || x == null
+const LBP_OF_LOA = 0.95 // LBP as a share of LOA, about, for a cargo ship: an estimate where no document states the LBP
+const ESTIMATED = 'Estimated'
+function absorb(d, a, kind) {
+  const read = a.particulars ?? {}
+  // (an estimate gives way to any document that states the figure)
+  const open = (k) => blank(d.principal[k]) || d.principalSource?.[k]?.startsWith(ESTIMATED)
+  const filled = Object.keys(read).filter((k) => k in d.principal && open(k))
+  const v = {
+    ...d,
+    name: d.name || titled(a.name ?? ''),
+    principal: { ...d.principal, ...Object.fromEntries(filled.map((k) => [k, read[k]])) },
+    principalSource: { ...d.principalSource, ...Object.fromEntries(filled.map((k) => [k, `From the ${DOC_NAMES[kind]}${a.particulars_source?.[k] ? `, ${a.particulars_source[k]}` : ''}`])) },
+    decks: { ...d.decks, ...Object.fromEntries(Object.entries(a.decks ?? {}).filter(([k]) => blank(d.decks?.[k])).map(([k, h]) => [k, h])) },
+    hull: kind === 'capacity' && a.hull?.points ? a.hull : (d.hull ?? null), // (only a capacity plan gives her hull, and a new one replaces it)
+  }
+  // no breadth or length printed: measured off the hull read from the capacity plan (twice its widest half-breadth,
+  // its length overall)
+  const pts = v.hull?.points
+  if (pts?.length) {
+    let ymax = 0
+    let xmin = Infinity
+    let xmax = -Infinity
+    for (let i = 0; i < pts.length; i += 3) {
+      ymax = Math.max(ymax, Math.abs(pts[i + 1]))
+      xmin = Math.min(xmin, pts[i])
+      xmax = Math.max(xmax, pts[i])
+    }
+    const fromHull = { breadth: Math.round(ymax * 20) / 10, loa: Math.round((xmax - xmin) * 10) / 10 }
+    for (const [k, value] of Object.entries(fromHull)) {
+      if (blank(v.principal[k]) && value > 0) {
+        v.principal = { ...v.principal, [k]: value }
+        v.principalSource = { ...v.principalSource, [k]: 'Measured off the hull lines read from the capacity plan' }
+      }
+    }
+  }
+  // no LBP stated anywhere yet, but an LOA: the LBP estimated from it, marked so, rather than holding the vessel up
+  if (blank(v.principal.lbp) && +v.principal.loa > 0) {
+    v.principal = { ...v.principal, lbp: Math.round(v.principal.loa * LBP_OF_LOA * 10) / 10 }
+    v.principalSource = { ...v.principalSource, lbp: `${ESTIMATED} as ${LBP_OF_LOA} × LOA: not stated in the documents read. Replace it if known.` }
+  }
+  // no depth stated: the moulded depth is the main (or upper) deck's height above base, as a capacity plan gives it
+  const deck = Object.entries(v.decks ?? {}).find(([k, h]) => /^(main|upper) deck$/i.test(k) && +h > 0)
+  if (blank(v.principal.depth) && deck) {
+    v.principal = { ...v.principal, depth: +deck[1] }
+    v.principalSource = { ...v.principalSource, depth: `${deck[0]} height above base, from the deck heights read` }
+  }
+  return matchDecks(v)
+}
+
+// the documents each builder takes: the ship's (as built, read once) and a loading condition's (each voyage's)
+const SCOPE_KINDS = { ship: ['capacity', 'ga'], condition: ['report', 'stow'] }
+const KIND_LABEL = { capacity: 'Capacity plan', ga: 'General arrangement', report: 'Stability report', stow: 'Stow / load plan' }
+const OTHER_PLACE = { ship: 'a loading condition', condition: 'the ship (Edit ship)' }
+
+function Builder({ scope, start, vessel, saved, cancel }) {
   const [v, setV] = useState(start)
-  const [capText, setCapText] = useState('')
-  const [kind, setKind] = useState('Ballast')
+  const [docs, setDocs] = useState({}) // kind: { name, answer }
+  const [queue, setQueue] = useState([]) // each file read: { id, name, kind, reading, started, error, drawn, wrong }
+  const [now, setNow] = useState(Date.now())
+  const reading = queue.some((q) => q.reading)
+  const kinds = SCOPE_KINDS[scope]
+  // (a clock for the elapsed times, while anything's being read; and the map told, for its progress chip)
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('vessel-reading', { detail: { reading: queue.filter((q) => q.reading).map((q) => q.name), done: queue.length > 0 && !reading } }))
+    if (!reading) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [queue, reading])
+  // a document read, put to use as the kind given (if it's one this builder takes)
+  const apply = (kind, name, a) => {
+    if (!kinds.includes(kind)) return
+    setDocs((all) => ({ ...all, [kind]: { name, answer: a } }))
+    setV((d) => {
+      const base = { ...d, documents: { ...d.documents, [kind]: name }, found: { ...(a.particulars ?? {}), ...(d.found ?? {}) } }
+      if (kind === 'report') return { ...base, name: d.name || name.replace(/\.pdf$/i, ''), report: { figures: { ...a.figures }, source: { ...a.source }, items: a.items ?? [] } }
+      if (kind === 'stow') {
+        const drawn = a.drawing?.units ?? []
+        return matchDecks({
+          ...base,
+          stow: drawn.length ? drawn.map((u) => ({ ...u, size: u.size ?? (u.height ? [...DEFAULT_UNIT.slice(0, 2), u.height] : null) })) : d.stow,
+          decks: { ...Object.fromEntries(drawn.filter((u) => u.deck).map((u) => [u.deck, ''])), ...d.decks },
+        })
+      }
+      return absorb(base, a, kind)
+    })
+  }
+  const add = (files) => {
+    for (const file of files) {
+      const id = `${file.name}-${Date.now()}-${Math.random()}`
+      setQueue((q) => [...q, { id, name: file.name, kind: null, reading: true, started: Date.now() }])
+      const body = new FormData()
+      body.append('file', file)
+      fetch('/api/vessels/pdf?kind=auto', { method: 'POST', body })
+        .then(async (res) => {
+          const a = await res.json()
+          if (!res.ok) throw new Error(a.detail ?? `Request failed (${res.status})`)
+          const wrong = !kinds.includes(a.kind)
+          setQueue((q) => q.map((x) => (x.id === id ? { ...x, reading: false, kind: a.kind, drawn: a.drawn_only, answer: a, wrong } : x)))
+          apply(a.kind, file.name, a)
+        })
+        .catch((e) => setQueue((q) => q.map((x) => (x.id === id ? { ...x, reading: false, error: e.message === 'Failed to fetch' ? 'Server could not be reached.' : e.message } : x))))
+    }
+  }
+  // a document taken for the wrong one: put to use as the one chosen
+  const retake = (q, kind) => {
+    setQueue((all) => all.map((x) => (x.id === q.id ? { ...x, kind, wrong: !kinds.includes(kind) } : x)))
+    apply(kind, q.name, q.answer)
+  }
   const [stowText, setStowText] = useState('')
   const [problem, setProblem] = useState('')
-  const lbp = +v.principal.lbp
-  const doc = (key, name) => setV((d) => ({ ...d, documents: { ...d.documents, [key]: name } }))
+  const lbp = +(scope === 'ship' ? v.principal?.lbp : vessel?.principal?.lbp)
   const save = async () => {
-    const stow = v.stow.map((u) => {
-      const deck = v.decks?.[u.deck]
-      const high = u.size?.[2] ?? u.height ?? DEFAULT_UNIT[2]
-      return { ...u, vcg: deck !== undefined && deck !== '' ? +deck + high / 2 : u.vcg }
-    })
-    const res = await fetch('/api/vessels', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...v, stow }) })
-    const answer = await res.json()
-    if (!res.ok) return setProblem(answer.detail)
+    setProblem('')
+    let body
+    if (scope === 'ship') {
+      const { principalSource, ...ship } = v
+      body = { ...(vessel ?? { conditions: [] }), ...ship }
+    } else {
+      const stow = v.stow.map((u) => {
+        const deck = v.decks?.[u.deck]
+        const high = u.size?.[2] ?? u.height ?? DEFAULT_UNIT[2]
+        return { ...u, vcg: deck !== undefined && deck !== '' ? +deck + high / 2 : u.vcg }
+      })
+      const cond = { id: v.id, name: v.name.trim() || 'Loading condition', report: v.report, stow, documents: v.documents, saved: new Date().toISOString() }
+      const others = (vessel.conditions ?? []).filter((c) => c.id !== cond.id)
+      // the ship's particulars left blank filled from what this condition's documents print (a stow plan's LOA and
+      // beam, say), and her LBP estimated from an LOA if still not known
+      const principal = { ...vessel.principal }
+      for (const k of ['lbp', 'loa', 'breadth', 'depth']) if (blank(principal[k]) && v.found?.[k]) principal[k] = v.found[k]
+      if (blank(principal.lbp) && +principal.loa > 0) principal.lbp = Math.round(principal.loa * LBP_OF_LOA * 10) / 10
+      body = { ...vessel, principal, conditions: [...others, cond], current: cond.id }
+    }
+    const res = await fetch('/api/vessels', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null)
+    if (!res) return setProblem('Could not be saved: server could not be reached. Restart the app from its shortcut.')
+    const answer = await res.json().catch(() => ({}))
+    if (!res.ok) return setProblem(`Could not be saved: ${answer.detail ?? `request failed (${res.status})`}`)
     saved(answer.id)
   }
   const field = (label, value, set) => (
@@ -327,99 +788,78 @@ function Builder({ start, saved, cancel }) {
   )
   return (
     <div className="flex flex-col gap-4 text-xs">
+      <h2 className="text-sm font-medium text-slate-200">{scope === 'ship' ? 'Ship' : 'Loading condition'}</h2>
       <label className="flex flex-col gap-0.5 text-slate-400">
-        Vessel name
+        {scope === 'ship' ? 'Vessel name' : 'Condition name'}
         <input value={v.name} onChange={(e) => setV({ ...v, name: e.target.value })} className={input} />
       </label>
 
-      <section className="flex flex-col gap-2" aria-label="Capacity plan">
-        <h3 className="font-medium text-slate-200">1. Capacity plan</h3>
-        <Pages label="Capacity plan (PDF)" kind="capacity" onPages={(name, a) => {
-          doc('capacity', name)
-          const got = a.capacity ?? {}
-          setV((d) => matchDecks({
-            ...d,
-            principal: Object.fromEntries(Object.entries(d.principal).map(([k, x]) => [k, x || got.particulars?.[k] || ''])),
-            decks: { ...d.decks, ...Object.fromEntries(Object.entries(got.decks ?? {}).map(([k, h]) => [k, d.decks?.[k] || h])) },
-          }))
-          // (her particulars, if the plan prints them as a report would)
-          const read = (key) => a.pages.join('\n').match(new RegExp(key === 'lbp' ? 'L\\.?B\\.?P\\.?[^\\d\\n]{0,20}(\\d+(?:\\.\\d+)?)' : key === 'breadth' ? '(?:breadth|beam)[^\\d\\n]{0,20}(\\d+(?:\\.\\d+)?)' : 'depth[^\\d\\n]{0,20}(\\d+(?:\\.\\d+)?)', 'i'))?.[1]
-          setV((d) => ({ ...d, principal: Object.fromEntries(['lbp', 'breadth', 'depth'].map((k) => [k, d.principal[k] || read(k) || ''])) }))
-        }} send={setCapText} />
-        <div className="grid grid-cols-3 gap-1.5">
-          {[['LBP, m', 'lbp'], ['Breadth, m', 'breadth'], ['Depth, m', 'depth']].map(([label, key]) => (
-            <div key={key}>{field(label, v.principal[key], (x) => setV((d) => ({ ...d, principal: { ...d.principal, [key]: x } })))}</div>
-          ))}
-        </div>
-        {Object.keys(v.decks ?? {}).length > 0 && (
-          <div className="grid grid-cols-3 gap-1.5">
-            {Object.entries(v.decks).map(([d, h]) => (
-              <label key={d} className="flex flex-col gap-0.5 text-slate-400">
-                {d} above baseline, m
-                <input type="number" step="any" value={h} onChange={(e) => setV((x) => matchDecks({ ...x, decks: { ...x.decks, [d]: e.target.value } }))} className={input} />
-              </label>
-            ))}
-          </div>
-        )}
-        {!v.principal.lbp && <p className="text-amber-200">LBP required{v.principal.loa ? ` (LOA ${v.principal.loa} m, from the stow plan)` : ''}. See the capacity plan or stability booklet.</p>}
-        <Table text={capText} setText={setCapText} columns={CAPACITY_COLUMNS} lbp={lbp} label="Compartments" add={(rows) => setV((d) => ({ ...d, compartments: [...d.compartments, ...rows.map((r) => ({ name: r.name, kind, capacity: r.capacity, lcg: r.lcg, tcg: r.tcg, vcg: r.vcg }))] }))}>
-          <select value={kind} onChange={(e) => setKind(e.target.value)} className="bg-slate-950" aria-label="Compartment type">
-            {Object.keys(KIND_RGB).map((k) => (
-              <option key={k}>{k}</option>
-            ))}
-          </select>
-        </Table>
-        {v.compartments.length > 0 && (
-          <p className="text-slate-400">
-            {v.compartments.length} compartments. <button type="button" className="text-red-300 underline" onClick={() => setV({ ...v, compartments: [] })}>Clear</button>
-          </p>
-        )}
-      </section>
+      <Uploads queue={queue} add={add} retake={retake} now={now} scope={scope} />
 
-      <section className="flex flex-col gap-2" aria-label="Stability report">
-        <h3 className="font-medium text-slate-200">2. Stability report</h3>
-        <Pages label="Stability report for the loading condition (PDF)" kind="report" onPages={(name, a) => {
-          doc('report', name)
-          setV((d) => ({
-            ...d,
-            name: d.name || titled(a.name ?? ''),
-            report: { figures: { ...a.figures }, source: { ...a.source }, items: a.items ?? [] },
-            // (its tank table: every tank with what's in it now and where, if the capacity plan gave none)
-            compartments: d.compartments.length ? d.compartments : (a.tanks ?? []),
-          }))
-        }} />
-        {v.report.items?.length > 0 && <p className="text-slate-400">Other weights read: {v.report.items.map((i) => `${i.name} ${fmt(i.weight, 1)} t`).join(', ')}.</p>}
-        <div className="grid grid-cols-3 gap-1.5">
-          {FIGURES.map(([key, label, unit]) => (
-            <div key={key} title={v.report.source[key] ?? 'Not found in the report. Enter manually.'}>
-              {field(`${label}, ${unit}`, v.report.figures[key], (x) => setV((d) => ({ ...d, report: { figures: { ...d.report.figures, [key]: x === '' ? undefined : +x }, source: { ...d.report.source, [key]: 'Entered manually' } } })))}
+      {scope === 'ship' ? (
+        <>
+          <section className="flex flex-col gap-2" aria-label="Capacity plan">
+            <h3 className="font-medium text-slate-200">Capacity plan</h3>
+            <Pages doc={docs.capacity} />
+            <p className="text-slate-500">{v.hull?.points?.length ? 'Hull lines read from the capacity plan.' : 'Hull lines come from the capacity plan’s frame sections and profile.'}</p>
+          </section>
+          <section className="flex flex-col gap-2" aria-label="General arrangement">
+            <h3 className="font-medium text-slate-200">General arrangement</h3>
+            <Pages doc={docs.ga} />
+            <p className="text-slate-500">Kept with the ship; its particulars and deck heights fill any left empty.</p>
+          </section>
+          <section className="flex flex-col gap-2" aria-label="Particulars">
+            <h3 className="font-medium text-slate-200">Particulars and decks</h3>
+            <div className="grid grid-cols-4 gap-1.5">
+              {[['LBP, m', 'lbp'], ['LOA, m', 'loa'], ['Breadth, m', 'breadth'], ['Depth, m', 'depth']].map(([label, key]) => (
+                <div key={key} title={v.principalSource?.[key] ?? 'Not found in the documents. Enter manually.'}>
+                  {field(label, v.principal[key], (x) => setV((d) => ({ ...d, principal: { ...d.principal, [key]: x }, principalSource: { ...d.principalSource, [key]: 'Entered manually' } })))}
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-        <p className="text-slate-500">As printed in the report. Hover over a field to see its source. LCG from AP.</p>
-      </section>
-
-      <section className="flex flex-col gap-2" aria-label="Stow plan">
-        <h3 className="font-medium text-slate-200">3. Stow plan</h3>
-        <Pages label="Stow plan (PDF)" kind="stow" onPages={(name, a) => {
-          doc('stow', name)
-          const drawn = a.drawing?.units ?? []
-          const got = a.drawing?.particulars ?? {}
-          setV((d) => matchDecks({
-            ...d,
-            principal: { ...d.principal, breadth: d.principal.breadth || got.breadth || '', loa: d.principal.loa || got.loa || '', lbp: d.principal.lbp || got.lbp || '', depth: d.principal.depth || got.depth || '' },
-            stow: drawn.length ? drawn.map((u) => ({ ...u, size: u.size ?? (u.height ? [...DEFAULT_UNIT.slice(0, 2), u.height] : null) })) : d.stow,
-            decks: { ...Object.fromEntries(drawn.filter((u) => u.deck).map((u) => [u.deck, ''])), ...d.decks },
-          }))
-        }} send={setStowText} />
-        {v.stow.length > 0 && <StowList v={v} setV={setV} />}
-        <Table text={stowText} setText={setStowText} columns={STOW_COLUMNS} lbp={lbp} label="Cargo" add={(rows) => setV((d) => ({ ...d, stow: [...d.stow, ...rows.map((r) => ({ name: r.name, weight: r.weight, lcg: r.lcg, tcg: r.tcg, vcg: r.vcg, ...(r.size ? { size: r.size } : {}) }))] }))} />
-
-      </section>
+            {Object.keys(v.decks ?? {}).length > 0 && (
+              <div className="grid grid-cols-3 gap-1.5">
+                {Object.entries(v.decks).map(([d, h]) => (
+                  <label key={d} className="flex flex-col gap-0.5 text-slate-400">
+                    {d} above baseline, m
+                    <input type="number" step="any" value={h} onChange={(e) => setV((x) => matchDecks({ ...x, decks: { ...x.decks, [d]: e.target.value } }))} className={input} />
+                  </label>
+                ))}
+              </div>
+            )}
+            {!v.principal.lbp && <p className="text-amber-200">LBP required: not found in the documents read. See the capacity plan or GA.</p>}
+            {v.principalSource?.lbp?.startsWith(ESTIMATED) && <p className="text-amber-200">LBP estimated as {LBP_OF_LOA} × LOA: not stated in the documents read. Replace it if known.</p>}
+            <p className="text-slate-500">Filled from whichever document states them. Hover over a field to see its source.</p>
+          </section>
+        </>
+      ) : (
+        <>
+          <section className="flex flex-col gap-2" aria-label="Stability report">
+            <h3 className="font-medium text-slate-200">Stability report</h3>
+            <Pages doc={docs.report} />
+            <div className="grid grid-cols-3 gap-1.5">
+              {FIGURES.map(([key, label, unit]) => (
+                <div key={key} title={v.report.source?.[key] ?? 'Not found in the report. Enter manually.'}>
+                  {field(`${label}, ${unit}`, v.report.figures?.[key], (x) => setV((d) => ({ ...d, report: { ...d.report, figures: { ...d.report.figures, [key]: x === '' ? undefined : +x }, source: { ...d.report.source, [key]: 'Entered manually' } } })))}
+                </div>
+              ))}
+            </div>
+            <p className="text-slate-500">As printed in the report. Hover over a field to see its source.</p>
+          </section>
+          <section className="flex flex-col gap-2" aria-label="Stow plan">
+            <h3 className="font-medium text-slate-200">Stow / load plan</h3>
+            <Pages doc={docs.stow} send={setStowText} />
+            {v.stow.length > 0 && <StowList v={v} setV={setV} />}
+            <Table text={stowText} setText={setStowText} columns={STOW_COLUMNS} lbp={lbp} label="Cargo" add={(rows) => setV((d) => ({ ...d, stow: [...d.stow, ...rows.map((r) => ({ name: r.name, weight: r.weight, lcg: r.lcg, tcg: r.tcg, vcg: r.vcg, ...(r.size ? { size: r.size } : {}) }))] }))} />
+          </section>
+        </>
+      )}
 
       {problem && <p className="text-amber-200">{problem}</p>}
       <div className="flex gap-2">
-        <button type="button" className={button} onClick={save}>Save vessel</button>
+        <button type="button" className={button} onClick={save} disabled={reading} title={reading ? 'Wait for the documents to be read' : undefined}>
+          {scope === 'ship' ? 'Save ship' : 'Save condition'}
+        </button>
         <button type="button" className="text-slate-400 underline" onClick={cancel}>Cancel</button>
       </div>
     </div>
@@ -427,8 +867,7 @@ function Builder({ start, saved, cancel }) {
 }
 
 function Figures({ vessel }) {
-  const f = vessel.report.figures
-  const kinds = Object.entries(Object.groupBy?.(vessel.compartments, (k) => k.kind) ?? {})
+  const f = vessel.report.figures ?? {}
   return (
     <div className="flex flex-col gap-3 text-sm">
       <section aria-label="Report figures">
@@ -436,7 +875,7 @@ function Figures({ vessel }) {
         <p className="text-xs text-slate-500">{vessel.documents.report ?? 'No report loaded'}</p>
         <dl className="mt-1 grid grid-cols-[1fr_auto] gap-x-3 gap-y-0.5 tabular-nums">
           {FIGURES.filter(([key]) => f[key] != null).map(([key, label, unit]) => (
-            <div key={key} className="contents" title={vessel.report.source[key]}>
+            <div key={key} className="contents" title={vessel.report.source?.[key]}>
               <dt className="text-slate-400">{label}</dt>
               <dd className="text-right">{fmt(f[key], key === 'displacement' || key === 'deadweight' ? 0 : 2)} {unit}</dd>
             </div>
@@ -457,19 +896,8 @@ function Figures({ vessel }) {
         </section>
       )}
       <section aria-label="Cargo">
-        <h2 className="font-medium">Stow plan</h2>
+        <h2 className="font-medium">Stow / load plan</h2>
         <p className="tabular-nums text-slate-300">{vessel.stow.length} units, {fmt(vessel.stow.reduce((t, u) => t + (u.weight || 0), 0), 1)} t</p>
-      </section>
-      <section aria-label="Compartments">
-        <h2 className="font-medium">Tanks and compartments</h2>
-        <ul className="tabular-nums text-slate-300">
-          {kinds.map(([kind, list]) => (
-            <li key={kind} className="flex items-center gap-2">
-              <span className="inline-block size-2.5 rounded-sm" style={{ background: `rgb(${KIND_RGB[kind] ?? KIND_RGB.Other})` }} aria-hidden="true" />
-              {kind}: {list.length}, {fmt(list.reduce((t, k) => t + (k.capacity || 0), 0), 0)} m³
-            </li>
-          ))}
-        </ul>
       </section>
       <p className="text-xs text-slate-500">Figures as printed in the stability report. This app does not calculate stability.</p>
     </div>
@@ -478,12 +906,23 @@ function Figures({ vessel }) {
 
 // --- the tab
 
-export function VesselTab() {
+const EMPTY_SHIP = { name: '', principal: { lbp: '', loa: '', breadth: '', depth: '' }, decks: {}, documents: {}, hull: null, conditions: [] }
+const emptyCondition = () => ({ id: `c${Date.now().toString(36)}`, name: '', report: { figures: {}, source: {}, items: [] }, stow: [], documents: {} })
+// her condition shown: the one marked current, else the latest
+export const currentCondition = (v) => v?.conditions?.find((c) => c.id === v.current) ?? v?.conditions?.at(-1) ?? null
+
+export function VesselTab({ hidden }) {
   const [list, setList] = useState([])
   const [vesselId, setVesselId] = useState('')
   const [vessel, setVessel] = useState(null)
-  const [editing, setEditing] = useState(null) // the vessel being read in, or null
+  const [editing, setEditing] = useState(null) // { scope: 'ship' | 'condition', start }, or null
   const [problem, setProblem] = useState('')
+  const [sea, setSea] = useState(null) // the sea state she's shown in (POST /api/vessels/{id}/sea)
+  const [live, setLive] = useState(null) // her roll, pitch and heave this moment, as drawn
+  useEffect(() => {
+    setSea(null)
+    setLive(null)
+  }, [vesselId, vessel?.current])
   const refresh = () =>
     fetch('/api/vessels')
       .then((res) => res.json())
@@ -494,16 +933,24 @@ export function VesselTab() {
         if (!found.length) setVessel(null)
       })
       .catch(() => setProblem('Vessels could not be loaded.'))
+  const open = (id) =>
+    fetch(`/api/vessels/${id}`)
+      .then((r) => r.json())
+      .then(setVessel)
+      .catch(() => setProblem('Vessel could not be opened.'))
   useEffect(() => {
     refresh()
   }, [])
   useEffect(() => {
-    if (!vesselId) return
-    fetch(`/api/vessels/${vesselId}`)
-      .then((r) => r.json())
-      .then(setVessel)
-      .catch(() => setProblem('Vessel could not be opened.'))
+    if (vesselId) open(vesselId)
   }, [vesselId])
+  const put = async (v) => {
+    const res = await fetch('/api/vessels', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(v) }).catch(() => null)
+    if (res?.ok) {
+      await open(vesselId)
+      window.dispatchEvent(new Event('vessels-changed'))
+    } else setProblem('Change could not be saved.')
+  }
   const remove = async () => {
     const res = await fetch(`/api/vessels/${vesselId}`, { method: 'DELETE' })
     if (res.ok) {
@@ -512,13 +959,32 @@ export function VesselTab() {
       refresh()
     }
   }
+  const cond = currentCondition(vessel)
+  // what's shown: the ship, in her current condition
+  const view = useMemo(
+    () => vessel && { ...vessel, report: cond?.report ?? { figures: {}, source: {}, items: [] }, stow: cond?.stow ?? [], documents: { ...vessel.documents, ...(cond?.documents ?? {}) } },
+    [vessel, cond],
+  )
+  const saved = async (id) => {
+    setEditing(null)
+    await refresh()
+    setVesselId(id)
+    open(id)
+  }
 
   return (
-    <main className="absolute inset-0 z-20 flex flex-col gap-3 overflow-y-auto bg-slate-950 px-4 pt-16 pb-4 text-slate-100 lg:flex-row lg:overflow-hidden [scrollbar-color:#475569_transparent] [scrollbar-width:thin]">
+    <main className={`absolute inset-0 z-20 ${hidden ? 'hidden' : 'flex'} flex-col gap-3 overflow-y-auto bg-slate-950 px-4 pt-16 pb-4 text-slate-100 lg:flex-row lg:overflow-hidden [scrollbar-color:#475569_transparent] [scrollbar-width:thin]`}>
       <aside aria-label="Documents" className="flex shrink-0 flex-col gap-3 text-sm lg:w-96 lg:overflow-y-auto lg:pr-1 [scrollbar-width:thin]">
         <h1 className="text-xl font-semibold">Own vessel</h1>
         {editing ? (
-          <Builder start={editing} cancel={() => setEditing(null)} saved={async (id) => { setEditing(null); await refresh(); setVesselId(id); fetch(`/api/vessels/${id}`).then((r) => r.json()).then(setVessel) }} />
+          <Builder
+            key={editing.scope + (editing.start.id ?? '')}
+            scope={editing.scope}
+            start={editing.start}
+            vessel={editing.scope === 'ship' ? (editing.start.conditions ? editing.start : vessel) : vessel}
+            cancel={() => setEditing(null)}
+            saved={saved}
+          />
         ) : (
           <>
             <div className="flex gap-2">
@@ -527,26 +993,68 @@ export function VesselTab() {
                   <option key={v.id} value={v.id}>{v.name}</option>
                 ))}
               </select>
+              <button type="button" className={button} onClick={() => setEditing({ scope: 'ship', start: EMPTY_SHIP })}>New vessel</button>
             </div>
-            <div className="flex flex-wrap gap-2">
-              <button type="button" className={button} onClick={() => setEditing(EMPTY)}>New from documents</button>
-              {vessel && (
-                <>
-                  <button type="button" className={button} onClick={() => setEditing(vessel)}>Edit</button>
-                  <button type="button" className="text-xs text-red-300 underline" onClick={remove}>Delete</button>
-                </>
-              )}
-            </div>
-            <p className="text-xs text-slate-500">Built from three PDFs: capacity plan (particulars and compartments), stability report for the loading condition (figures) and stow plan (cargo).</p>
+            {vessel && (
+              <>
+                <section aria-label="Ship" className="flex flex-col gap-1.5 rounded-lg border border-slate-800 p-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="font-medium">Ship</h2>
+                    <div className="flex gap-3 text-xs">
+                      <button type="button" className="text-cyan-200 underline" onClick={() => setEditing({ scope: 'ship', start: { ...vessel } })}>Edit ship</button>
+                      <button type="button" className="text-red-300 underline" onClick={() => window.confirm(`Delete ${vessel.name}, her hull and all her loading conditions? This cannot be undone.`) && remove()}>Delete vessel</button>
+                    </div>
+                  </div>
+                  <p className="text-xs tabular-nums text-slate-300">
+                    LBP {fmt(vessel.principal.lbp, 1)} m · LOA {fmt(vessel.principal.loa, 1)} m · B {fmt(vessel.principal.breadth, 1)} m · D {fmt(vessel.principal.depth, 1)} m
+                  </p>
+                  <p className="text-xs text-slate-400">Capacity plan: {vessel.documents.capacity ?? '–'}{vessel.hull?.points?.length ? ' (hull lines read)' : ''}</p>
+                  <p className="text-xs text-slate-400">General arrangement: {vessel.documents.ga ?? '–'}</p>
+                </section>
+                <section aria-label="Loading conditions" className="flex flex-col gap-1.5 rounded-lg border border-slate-800 p-3">
+                  <div className="flex items-center justify-between">
+                    <h2 className="font-medium">Loading conditions</h2>
+                    <button type="button" className="text-xs text-cyan-200 underline" onClick={() => setEditing({ scope: 'condition', start: { ...emptyCondition(), decks: vessel.decks } })}>
+                      New condition
+                    </button>
+                  </div>
+                  {vessel.conditions?.length ? (
+                    <ul className="flex flex-col gap-1 text-xs">
+                      {[...vessel.conditions].reverse().map((c) => (
+                        <li key={c.id} className={`flex items-center gap-2 rounded px-1.5 py-1 ${c.id === cond?.id ? 'bg-cyan-400/10' : ''}`}>
+                          <input type="radio" checked={c.id === cond?.id} onChange={() => put({ ...vessel, current: c.id })} aria-label={`Show ${c.name}`} />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-slate-200" title={c.name}>{c.name}</span>
+                            <span className="block truncate text-slate-500" title={[c.documents?.report, c.documents?.stow].filter(Boolean).join(', ')}>
+                              GM {fmt(c.report?.figures?.gm)} m · T {fmt(c.report?.figures?.draught_mid)} m · {c.stow?.length ?? 0} units
+                            </span>
+                          </span>
+                          <button type="button" className="text-cyan-200 underline" onClick={() => setEditing({ scope: 'condition', start: { ...c, decks: vessel.decks } })}>Edit</button>
+                          <button type="button" className="text-red-300 underline" onClick={() => window.confirm(`Delete the loading condition ${c.name}?`) && put({ ...vessel, conditions: vessel.conditions.filter((x) => x.id !== c.id) })}>Delete</button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-xs text-slate-400">No loading condition yet. Add one from a stability report and a stow or load plan.</p>
+                  )}
+                </section>
+              </>
+            )}
+            <p className="text-xs text-slate-500">The ship is read once from her capacity plan (hull lines, particulars) and GA. Each loading condition comes from a stability report (drafts, trim, list, GM) and a stow or load plan.</p>
           </>
         )}
         {problem && <p className="text-xs text-amber-200">{problem}</p>}
       </aside>
       <section aria-label="The vessel" className="relative min-h-96 flex-1 overflow-hidden rounded-xl border border-slate-800 bg-slate-900">
-        {vessel ? <VesselView vessel={vessel} /> : <p className="p-4 text-sm text-slate-400">No vessel loaded. Select New from documents to add one.</p>}
+        {view ? <VesselView vessel={view} sea={sea} active={!hidden} onLive={setLive} /> : <p className="p-4 text-sm text-slate-400">No vessel loaded. Select New vessel to add one.</p>}
       </section>
       <aside aria-label="Figures" className="shrink-0 lg:w-72 lg:overflow-y-auto lg:pl-1 [scrollbar-width:thin]">
-        {vessel && <Figures vessel={vessel} />}
+        {view && (
+          <div className="flex flex-col gap-4">
+            <SeaPanel key={view.id + (cond?.id ?? '')} vessel={view} sea={sea} setSea={setSea} live={live} />
+            {cond ? <Figures vessel={view} /> : <p className="text-sm text-slate-400">No loading condition: shown at no draught. Add one for her drafts and motions.</p>}
+          </div>
+        )}
       </aside>
     </main>
   )

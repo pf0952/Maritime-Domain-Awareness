@@ -64,8 +64,8 @@ def watch(windows: dict, server) -> None:
     while not server.should_exit:
         time.sleep(2)
         alive, bye = windows["alive"], windows["bye"]
-        if alive is None:
-            continue
+        if alive is None or windows.get("busy"):
+            continue  # (nor while a document's being read: OCR can keep a window from saying it's open)
         now = time.time()
         closed = bye is not None and bye >= alive and now - bye > GRACE
         if closed or now - alive > QUIET:

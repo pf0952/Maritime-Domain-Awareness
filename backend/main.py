@@ -71,7 +71,7 @@ def same_site(origin: str | None = Header(None), host: str | None = Header(None)
 
 # when the viewer's windows last said they were open, and when one last said it was closing: launch.py stops the
 # server once none is left
-windows = {"alive": None, "bye": None}
+windows = {"alive": None, "bye": None, "busy": 0}  # (busy: documents being read just now)
 
 
 @app.post("/api/alive", dependencies=[Depends(same_site)])
@@ -344,34 +344,114 @@ def get_vessel(vessel_id: str):
 
 
 @app.post("/api/vessels/pdf", dependencies=[Depends(same_site)])
-async def post_vessel_pdf(file: UploadFile, kind: str = Query("capacity", pattern="^(capacity|report|stow)$")):
-    """A document's pages as text, to pick its tables from; and what it says read off it: a stability report's figures,
-    tanks and weights; a stow plan's units, from its tables or placed off its drawing."""
+async def post_vessel_pdf(file: UploadFile, kind: str = Query("auto", pattern="^(auto|capacity|ga|report|stow)$")):
+    """A document's pages as text, to pick its tables from, and all it says read off it: the ship's particulars, deck
+    heights, a tank table, a stability report's figures and weights, a stow plan's units. Which document it is, the
+    one asked for or, with auto, worked out: drawn with no text, a capacity plan (read by OCR); printing a condition's
+    figures, a stability report; with cargo units, a stow plan. While it's read, the server stays up (launch.py)."""
     data = await file.read(vessel_docs.PDF_MOST + 1)
     if len(data) > vessel_docs.PDF_MOST:
         raise HTTPException(413, "PDF exceeds 60 MB")
+    windows["busy"] += 1
+    try:
+        return await run_in_threadpool(read_vessel_pdf, data, kind, file.filename or "")
+    finally:
+        windows["busy"] -= 1
+
+
+def is_ga(text: str, filename: str) -> bool:
+    """A general arrangement plan: so titled ("GENERAL ARRANGEMENT", "GENERAL PLAN") or so named ("GA", "general
+    plan", "general arrangement"), and not titled a capacity plan."""
+    if re.search(r"CAPACITY\s*PLAN", text, re.IGNORECASE):
+        return False
+    return bool(re.search(r"GENERAL\s*(ARRANGEMENT|PLAN)", text, re.IGNORECASE)
+                or re.search(r"(^|[^a-z])(ga|general.?(arrangement|plan))([^a-z]|$)", filename.lower()))
+
+
+def read_vessel_pdf(data: bytes, kind: str, filename: str) -> dict:
     try:
         pages = vessel_docs.pdf_pages(data)
     except Exception as e:  # (pypdf raises its own kinds for a damaged or encrypted file)
         raise HTTPException(422, f"PDF could not be read: {e}")
     out = {"pages": pages, "drawn_only": not any(p.strip() for p in pages)}
     try:
-        if kind == "report":
+        words = []
+        if out["drawn_only"]:
+            out["kind"] = "capacity" if kind == "auto" else kind
+            if out["kind"] in ("capacity", "ga"):  # (a drawn plan's words by OCR: a minute or two)
+                words = vessel_docs.drawn_words(data)
+                if not words:
+                    out["problem"] = "No text read: OCR is not installed (see backend/requirements.txt)"
+                out["capacity"] = {"ocr": True, "words": len(words)}
+                if kind == "auto" and is_ga(" ".join(w[3] for w in words), filename):
+                    out["kind"] = "ga"
+                if words and out["kind"] == "capacity":  # (her hull, from the plan's sections and profile)
+                    import plan_geometry
+
+                    hull = plan_geometry.hull_from_plan(data, words)
+                    if hull:
+                        out["hull"] = {**hull["mesh"], "aft": hull["aft"], "fore": hull["fore"], "sections": len(hull["sections"])}
+        else:
+            words = [(ln["x"], ln["y"], 1.0, ln["text"]) for ln in vessel_docs.text_runs(data)]
             out.update(vessel_docs.read_report(pages))
-        elif kind == "stow" and not out["drawn_only"]:
             out["drawing"] = vessel_docs.read_drawing(data)
-        elif kind == "capacity":
-            # (a drawn plan's words read by OCR, a minute or two: off the server's loop, so the rest of the app runs on)
-            if out["drawn_only"]:
-                words = await run_in_threadpool(vessel_docs.drawn_words, data)
+            if kind == "auto":
+                named = filename.lower()
+                out["kind"] = ("ga" if is_ga(" ".join(pages), filename) else
+                               "report" if len(out["figures"]) >= 4 or "stab" in named else
+                               "stow" if out["drawing"]["units"] or "stow" in named else "capacity")
             else:
-                words = [(ln["x"], ln["y"], 1.0, ln["text"]) for ln in vessel_docs.text_runs(data)]
-            out["capacity"] = {**vessel_docs.read_capacity(words), "ocr": out["drawn_only"], "words": len(words)}
-            if out["drawn_only"] and not words:
-                out["problem"] = "No text read: OCR is not installed (see backend/requirements.txt)"
+                out["kind"] = kind
+        read = vessel_docs.read_particulars(pages)
+        drawn = vessel_docs.read_capacity(words)
+        particulars, source = dict(read["particulars"]), dict(read["source"])
+        for k, v in {**(out.get("drawing") or {}).get("particulars", {}), **drawn["particulars"]}.items():
+            if k not in particulars:
+                particulars[k], source[k] = v, "from the drawing's text" if not out["drawn_only"] else "read by OCR"
+        out.update(particulars=particulars, particulars_source=source, decks=drawn["decks"])
     except Exception as e:  # (a reading that trips on an odd layout leaves the pages to read by hand)
         out["problem"] = f"Document only partly read: {e}"
+        out.setdefault("kind", "capacity" if kind == "auto" else kind)
     return out
+
+
+@app.post("/api/vessels/{vessel_id}/sea", dependencies=[Depends(same_site)])
+def post_vessel_sea(vessel_id: str, heading: float = Body(0.0), speed: float = Body(0.0), lat: float | None = Body(None),
+                    lng: float | None = Body(None), sea: list | None = Body(None)):
+    """How the vessel, as her stability report gives her, moves in a sea: the forecast's now at a place, or one given
+    as [[height m, period s, from °], ...]; on a heading at a speed. Her motions' significant values, and the waves
+    to draw her moving in. An estimate from her GM and the sea, not her own seakeeping."""
+    import motions
+
+    try:
+        v = vessel_docs.load(vessel_id)
+    except (OSError, ValueError):
+        raise HTTPException(404, f"Vessel not found: {vessel_id}")
+    f = vessel_docs.current(v).get("report", {}).get("figures", {})
+    p = v["principal"]
+    draught = f.get("draught_mid") or max(f.get("draught_aft") or 0, f.get("draught_fwd") or 0)
+    if not p.get("lbp") or not p.get("breadth") or not draught:
+        raise HTTPException(422, "LBP and breadth (ship), and a draught (loading condition), are needed for the motions")
+    ship = {"lbp": p["lbp"], "beam": p["breadth"], "draught": draught, "gm": f.get("gm"), "roll_period": f.get("roll_period")}
+    forecast = None
+    if sea is None:
+        if lat is None or lng is None:
+            raise HTTPException(422, "A position for the forecast, or a sea, is needed")
+        try:
+            forecast = routes.forecast_at([[lng, lat]], [0.0], time.time())[0]
+        except (OSError, ValueError) as e:
+            raise HTTPException(503, f"Forecast unavailable: {e}")
+        if forecast is None:
+            raise HTTPException(404, "No marine forecast at that position (over land, or outside the forecast)")
+        sea = routes.sea_of(forecast)
+    try:
+        sea = [(float(h), float(t_), float(d)) for h, t_, d in sea][:4]
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Sea must be [[height, period, from], ...]")
+    m = motions.respond(ship, heading, speed, sea)
+    return {"forecast": forecast, "sea": sea, "ship": ship,
+            "motion": {k: round(m[k], 2) for k in ("roll", "pitch", "heave", "roll_period")} | {"warnings": m["warnings"]},
+            "components": motions.components(ship, heading, speed, sea)}
 
 
 @app.put("/api/vessels", dependencies=[Depends(same_site)])

@@ -282,6 +282,12 @@ export default function App() {
   const [routeMode, setRouteMode] = useState(null) // 'edit': clicks lay waypoints; 'plan': clicks set its two ends
   const [planEnds, setPlanEnds] = useState([])
   const [findings, setFindings] = useState(null) // the last check's
+  const [docReading, setDocReading] = useState(null) // vessel documents being read in the Vessel tab, for the map's chip
+  useEffect(() => {
+    const seen = (e) => setDocReading(e.detail)
+    window.addEventListener('vessel-reading', seen)
+    return () => window.removeEventListener('vessel-reading', seen)
+  }, [])
   const [passageAt, setPassageAt] = useState(null) // where the motions side bar has My vessel along her passage
   const [pickedWaypoint, setPickedWaypoint] = useState(null)
   const routeNow = useRef({})
@@ -381,6 +387,7 @@ export default function App() {
     })
     m.addControl(overlay.current)
     map.current = m
+    window.mdaMapCentre = () => m.getCenter() // (the Vessel tab's sea state at the map's centre)
 
     const have = new Map() // key: chart, the most lately used last
     const tiers = new Map() // tier: the charts it needs and the area they're for, as last fetched
@@ -1627,7 +1634,29 @@ export default function App() {
         ))}
       </div>
       {tab === 'fleet' && <FleetView showTrack={showFleetTrack} />}
-      {tab === 'vessel' && <VesselTab />}
+      <VesselTab hidden={tab !== 'vessel'} />
+      {docReading && tab !== 'vessel' && (docReading.reading.length > 0 || docReading.done) && (
+        <button
+          type="button"
+          onClick={() => {
+            setTab('vessel')
+            setDocReading(null)
+          }}
+          className="absolute top-16 right-4 z-30 flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900/95 px-3 py-1.5 text-sm text-slate-200 shadow-xl hover:text-cyan-300"
+        >
+          {docReading.reading.length > 0 ? (
+            <>
+              <span className="size-3 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" aria-hidden="true" />
+              Reading {docReading.reading.length} vessel document{docReading.reading.length > 1 ? 's' : ''}… Open Vessel tab
+            </>
+          ) : (
+            <>
+              <span className="text-emerald-300" aria-hidden="true">✓</span>
+              Vessel documents read. Review in Vessel tab
+            </>
+          )}
+        </button>
+      )}
       {tab === 'map' && route.passage?.for === route.waypoints && <MotionsBar passage={route.passage} onAt={setPassageAt} />}
       <SearchBar go={goTo} />
       {measuring && (

@@ -5,6 +5,7 @@
 // RTZ, its leg is the one that runs to it from the waypoint before: { geometry: 'rhumb' | 'great', speed, xtd }
 import { useEffect, useRef, useState } from 'react'
 import { rhumb } from './geo'
+import { currentCondition } from './vessel'
 
 export const ROUTE_SPEED = 10 // knots, for a new route
 export const ROUTE_XTD = 0.1 // nm either side, for a new route
@@ -303,10 +304,11 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
     run('Loading vessel…', async () => {
       if (!id) return set({ myVessel: null })
       const v = await fetch(`/api/vessels/${id}`).then((r) => r.json())
-      const f = v.report.figures
+      const cond = currentCondition(v) // (her loading condition marked current in the Vessel tab)
+      const f = cond?.report?.figures ?? {}
       const draught = Math.max(f.draught_aft ?? 0, f.draught_fwd ?? 0, f.draught_mid ?? 0)
       // the heaviest cargo, for the accelerations at their places
-      const cargo = [...v.stow].filter((u) => u.lcg != null && u.vcg != null).sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0)).slice(0, 12)
+      const cargo = [...(cond?.stow ?? [])].filter((u) => u.lcg != null && u.vcg != null).sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0)).slice(0, 12)
         .map((u) => ({ name: u.name || 'Cargo', x: u.lcg, y: u.tcg ?? 0, z: u.vcg }))
       set({
         vessel: { ...route.vessel, ...(draught ? { draught: +draught.toFixed(2) } : {}), ...(f.air_draught ? { air_draught: f.air_draught } : {}) },

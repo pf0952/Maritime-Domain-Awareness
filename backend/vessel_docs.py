@@ -7,6 +7,7 @@ compartments: [{name, kind, capacity, lcg, tcg, vcg}], stow: [{name, weight, lcg
 documents: {capacity, report, stow: file names} }. Frame: x m from the aft perpendicular (+ forward), y m from the
 centreline (+ starboard), z m above the baseline."""
 import io
+import os
 import json
 import re
 from pathlib import Path
@@ -32,9 +33,14 @@ FIGURES = {
     "tcg": [r"^TCG\b"],
     "roll_period": [r"\bperiod\s*of\s*roll", r"\broll(?:ing)?\s*period\b"],
     "air_draught": [r"\bair\s*dra(?:ugh|f)t\b(?!s)", r"\b(?:signal\s*)?mast\s*top\b"],
-    "lbp": [r"\bL\.?B\.?P\.?\b", r"\blength\s*between\s*perp"],
-    "breadth": [r"^breadth\b", r"^beam\b", r"\bbreadth\s*mld"],
-    "depth": [r"^depth\b"],
+}
+# the ship's particulars, by the labels documents print them with, each with the range a ship's can be in (a number
+# outside it belongs to something else on the line)
+PARTICULARS = {
+    "lbp": ([r"\bL\.?\s?B\.?\s?P\b\.?", r"\bL\.?\s?P\.?\s?P\b\.?", r"\blength\s*(?:b\.?\s*p\b|between\s*perp)"], (10, 500)),
+    "loa": ([r"\bL\.?\s?O\.?\s?A\b\.?", r"\blength\s*over\s*all\b|\boverall\s*length\b"], (10, 500)),
+    "breadth": ([r"\b(?:moulded\s*)?breadth\b(?!\s*(?:extreme|ext))", r"\bbeam\b(?!\s*seas?\b)",r"\bB\s*\.?\s*mld\b"], (2, 80)),
+    "depth": ([r"\b(?:moulded\s*)?depth\b(?!\s*(?:contour|area|of\s*water))", r"\bD\s*\.?\s*mld\b"], (1, 50)),
 }
 NUMBER = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 LEADING_NUMBER = re.compile(r"^[-+]?\d[\d,]*(?:\.\d+)?")
@@ -149,6 +155,19 @@ def tables(pages: list) -> list:
 
 # a weights table's rows that sum others up, not weights of their own
 SUMMARY = re.compile(r"^(?:tanks|dead\s*w(?:eigh)?t\.?(?:\s*reserve)?|displacement|light\s*ship|total.*|holds)$", re.IGNORECASE)
+
+
+def read_particulars(pages: list) -> dict:
+    """LBP, LOA, breadth and depth wherever a document prints them, each with where: {particulars, source}."""
+    labelled = [(p + 1, line.strip(), label, value) for p, text in enumerate(pages) for line in text.splitlines() for label, value in pairs(line)]
+    found, source = {}, {}
+    for key, (patterns, (low, high)) in PARTICULARS.items():
+        for pattern in patterns:
+            hit = next(((p, line, v) for p, line, label, v in labelled if re.search(pattern, label, re.IGNORECASE) and low <= v <= high), None)
+            if hit:
+                found[key], source[key] = hit[2], f"p. {hit[0]}: {re.sub(r'\s{2,}', '  ', hit[1])[:120]}"
+                break
+    return {"particulars": found, "source": source}
 
 
 def read_report(pages: list) -> dict:
@@ -410,16 +429,25 @@ def drawn_image(data: bytes, scale: float = DRAWN_SCALE):
 _ocr = None
 
 
-def drawn_words(data: bytes) -> list:
-    """The words on a vector-only PDF, by OCR of its page drawn here, in tiles: [(x, y, height, text)] in PDF points,
-    y up the page as PDF has it. Empty if OCR isn't installed."""
+def _ocr_engine():
+    """The OCR engine, made once; None if OCR isn't installed."""
     global _ocr
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except ImportError:
-        return []
     if _ocr is None:
-        _ocr = RapidOCR()
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            return None
+        threads = max(1, (os.cpu_count() or 2) - 1)  # (a core left for the app's window and the rest)
+        _ocr = RapidOCR(intra_op_num_threads=threads, inter_op_num_threads=1)
+    return _ocr
+
+
+def drawn_words(data: bytes) -> list:
+    """The words on a vector-only PDF, by OCR of its page drawn here, in tiles: [(x, y, height, text, width)] in PDF
+    points, y up the page as PDF has it. Empty if OCR isn't installed."""
+    ocr = _ocr_engine()
+    if ocr is None:
+        return []
     img, (w, h) = drawn_image(data)
     words, step = [], DRAWN_TILE - DRAWN_OVERLAP
     H, W = img.shape
@@ -428,12 +456,12 @@ def drawn_words(data: bytes) -> list:
             tile = img[top : top + DRAWN_TILE, left : left + DRAWN_TILE]
             if tile.min() > 200:
                 continue  # (blank)
-            found, _ = _ocr(tile)
+            found, _ = ocr(tile)
             for box, text, conf in found or []:
                 xs, ys = [p[0] + left for p in box], [p[1] + top for p in box]
                 if float(conf) < 0.5:
                     continue
-                words.append((min(xs) / DRAWN_SCALE, h - max(ys) / DRAWN_SCALE, (max(ys) - min(ys)) / DRAWN_SCALE, text.strip()))
+                words.append((min(xs) / DRAWN_SCALE, h - max(ys) / DRAWN_SCALE, (max(ys) - min(ys)) / DRAWN_SCALE, text.strip(), (max(xs) - min(xs)) / DRAWN_SCALE))
     # (a word read twice where tiles overlap: kept once)
     out = []
     for w_ in sorted(words, key=lambda v: (-v[1], v[0])):
@@ -455,12 +483,12 @@ def read_capacity(words: list) -> dict:
     import difflib
 
     found = {}
-    for x, y, h, text in words:
+    for x, y, h, text, *_ in words:
         key = re.sub(r"[^A-Z0-9]", "", text.upper())
         match = difflib.get_close_matches(key, DECK_NAMES, n=1, cutoff=0.75)
         if not match:
             continue
-        below = [(y - y2, t2) for x2, y2, h2, t2 in words if 0 < y - y2 < 2.5 * max(h, 1) and abs(x2 - x) < 12
+        below = [(y - y2, t2) for x2, y2, h2, t2, *_ in words if 0 < y - y2 < 2.5 * max(h, 1) and abs(x2 - x) < 12
                  and re.search(r"\d{3,5}(?:/\d+)?\s*[a-z]{0,3}\.?\s*B", t2)]
         if not below:
             continue
@@ -468,7 +496,7 @@ def read_capacity(words: list) -> dict:
         name = DECK_NAMES[match[0]]
         if name not in found or h > found[name][1]:
             found[name] = (value, h)
-    text = " ".join(t for *_, t in words)
+    text = " ".join(w[3] for w in words)
     particulars = {k: number(m.group(1)) for k, pat in (("lbp", r"\b(?:L\.?B\.?P|L\.?P\.?P)\.?\s*[:=]?\s*([\d.,]+)"), ("loa", r"\bL\.?O\.?A\.?\s*[:=]?\s*([\d.,]+)"),
                                                          ("breadth", r"\b(?:BREADTH|BEAM|B\s*mld)\.?\s*[:=]?\s*([\d.,]+)"), ("depth", r"\bDEPTH\.?\s*[:=]?\s*([\d.,]+)"))
                    for m in [re.search(pat, text, re.IGNORECASE)] if m}
@@ -510,15 +538,68 @@ def vessels() -> list:
 
 def load(vessel_id: str) -> dict:
     v = json.loads((STORE / f"{slug(vessel_id)}.json").read_text(encoding="utf-8"))
-    return {**v, "id": slug(vessel_id)}
+    return {**migrated(v), "id": slug(vessel_id)}
+
+
+def migrated(v: dict) -> dict:
+    """A vessel kept before the ship and her conditions were apart: her one report and stow plan as her first
+    condition."""
+    if "conditions" in v:
+        return v
+    v = dict(v)
+    report, stow, docs = v.pop("report", None), v.pop("stow", None), dict(v.get("documents") or {})
+    v.pop("compartments", None)
+    v["documents"] = {k: n for k, n in docs.items() if k in SHIP_DOCS}
+    v["conditions"] = []
+    if report or stow:
+        name = (docs.get("report") or "Condition 1").rsplit(".", 1)[0]
+        v["conditions"] = [{"id": "c1", "name": name, "report": report or {}, "stow": stow or [],
+                            "documents": {k: n for k, n in docs.items() if k in CONDITION_DOCS}}]
+        v["current"] = "c1"
+    return v
+
+
+def current(v: dict) -> dict:
+    """Her condition shown and sailed with: the one marked current, else the latest."""
+    conds = v.get("conditions") or []
+    return next((c for c in conds if c.get("id") == v.get("current")), conds[-1] if conds else {})
 
 
 def _num(v):
     return None if v in (None, "") else float(v)
 
 
+def _mesh(m: dict) -> dict | None:
+    """A triangle mesh kept as numbers only: {points: [x, y, z, ...], triangles: [i, j, k, ...]}."""
+    pts, tris = m.get("points") or [], m.get("triangles") or []
+    if not pts or not tris or len(pts) % 3 or len(tris) % 3:
+        return None
+    n = len(pts) // 3
+    return {"points": [round(float(c), 3) for c in pts], "triangles": [int(i) for i in tris if 0 <= int(i) < n]}
+
+
+SHIP_DOCS = ("capacity", "ga")  # her own documents: the ship as built
+CONDITION_DOCS = ("report", "stow")  # a voyage's: the condition she's loaded to
+
+
+def _report(r: dict) -> dict:
+    return {"figures": {k: float(x) for k, x in (r.get("figures") or {}).items() if k in FIGURES and x not in (None, "")},
+            "source": {k: str(s)[:200] for k, s in (r.get("source") or {}).items() if k in FIGURES},
+            "items": [{"name": str(c.get("name") or "")[:80], **{k: _num(c.get(k)) for k in ("weight", "lcg", "tcg", "vcg")}}
+                      for c in (r.get("items") or [])[:200]]}
+
+
+def _stow(units: list) -> list:
+    return [{"name": str(c.get("name") or "")[:80], **{k: _num(c.get(k)) for k in ("weight", "lcg", "tcg", "vcg", "height")},
+             **({"deck": str(c["deck"])[:40]} if c.get("deck") else {}),
+             **({"size": [float(s) for s in c["size"]]} if c.get("size") else {})} for c in (units or [])[:5000]]
+
+
 def save(v: dict) -> str:
-    """Kept as given, its numbers checked as numbers: raises ValueError on anything else."""
+    """Kept as given, its numbers checked as numbers: raises ValueError on anything else. The ship (her particulars,
+    decks, hull, from her capacity plan and GA) apart from her loading conditions (each a stability report's figures
+    and a stow plan's units), one of them current."""
+    v = migrated(v)
     name = str(v.get("name") or "").strip()
     if not name:
         raise ValueError("Vessel name required")
@@ -526,17 +607,16 @@ def save(v: dict) -> str:
         "name": name[:120],
         "principal": {k: _num((v.get("principal") or {}).get(k)) for k in ("lbp", "loa", "breadth", "depth")},
         "decks": {str(k)[:40]: float(h) for k, h in (v.get("decks") or {}).items() if h not in (None, "")},
-        "report": {"figures": {k: float(x) for k, x in ((v.get("report") or {}).get("figures") or {}).items() if k in FIGURES and x not in (None, "")},
-                   "source": {k: str(s)[:200] for k, s in ((v.get("report") or {}).get("source") or {}).items() if k in FIGURES},
-                   "items": [{"name": str(c.get("name") or "")[:80], **{k: _num(c.get(k)) for k in ("weight", "lcg", "tcg", "vcg")}}
-                             for c in ((v.get("report") or {}).get("items") or [])[:200]]},
-        "compartments": [{"name": str(c.get("name") or "")[:80], "kind": str(c.get("kind") or "Other")[:30],
-                          **{k: _num(c.get(k)) for k in ("capacity", "volume", "weight", "lcg", "tcg", "vcg")}} for c in (v.get("compartments") or [])[:2000]],
-        "stow": [{"name": str(c.get("name") or "")[:80], **{k: _num(c.get(k)) for k in ("weight", "lcg", "tcg", "vcg", "height")},
-                  **({"deck": str(c["deck"])[:40]} if c.get("deck") else {}),
-                  **({"size": [float(s) for s in c["size"]]} if c.get("size") else {})} for c in (v.get("stow") or [])[:5000]],
-        "documents": {k: str(n)[:200] for k, n in (v.get("documents") or {}).items() if k in ("capacity", "report", "stow")},
+        "documents": {k: str(n)[:200] for k, n in (v.get("documents") or {}).items() if k in SHIP_DOCS},
+        "hull": _mesh(v.get("hull") or {}),
+        "conditions": [{"id": re.sub(r"[^a-z0-9-]", "", str(c.get("id") or f"c{i + 1}").lower())[:20] or f"c{i + 1}",
+                        "name": str(c.get("name") or f"Condition {i + 1}")[:120], "report": _report(c.get("report") or {}),
+                        "stow": _stow(c.get("stow")), "saved": str(c.get("saved") or "")[:30],
+                        "documents": {k: str(n)[:200] for k, n in (c.get("documents") or {}).items() if k in CONDITION_DOCS}}
+                       for i, c in enumerate((v.get("conditions") or [])[:200])],
     }
+    ids = [c["id"] for c in clean["conditions"]]
+    clean["current"] = v.get("current") if v.get("current") in ids else (ids[-1] if ids else None)
     if not clean["principal"]["lbp"] or not clean["principal"]["breadth"]:
         raise ValueError("LBP and breadth required: enter them if the documents do not state them (a drawn capacity plan shows the LBP)")
     STORE.mkdir(parents=True, exist_ok=True)
@@ -562,7 +642,10 @@ if __name__ == "__main__":
     assert f["displacement"] == 31812.0 and f["deadweight"] == 19078.2, f
     assert (f["draught_aft"], f["draught_fwd"], f["draught_mid"]) == (10.07, 8.37, 9.22), f
     assert f["gm"] == 0.59 and f["kg"] == 12.98 and f["km"] == 13.57, f  # (the corrected ones, not solid)
-    assert f["roll_period"] == 27.3 and f["lbp"] == 183.69 and f["breadth"] == 28.65, f
+    assert f["roll_period"] == 27.3, f
+    pp = read_particulars(["Particulars: LBP 183.69 m  Breadth 28.65 m  Depth 20.42 m", "Length b.p.   140.00 m   Length over all  153.80 m"])["particulars"]
+    assert pp == {"lbp": 183.69, "loa": 153.8, "breadth": 28.65, "depth": 20.42}, pp
+    assert read_particulars(["Depth contours 5 10 20", "Beam sea 3"])["particulars"] == {}
     assert r["source"]["gm"].startswith("p. 2"), r["source"]
     # a MACS3-style printout: values far from their labels, two pairs a line, a tank table over a units line
     tank_page = [
