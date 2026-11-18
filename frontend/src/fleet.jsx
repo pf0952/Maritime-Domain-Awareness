@@ -8,7 +8,7 @@ const MOST = 50
 const REFRESH = 600000 // ms: the recorder looks every 10 minutes
 const day = (t) => new Date(t * 1000).toLocaleDateString([], { day: 'numeric', month: 'short', year: '2-digit' })
 const moment = (t) => new Date(t * 1000).toLocaleString([], { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })
-const portName = (port) => (port ? `${port.name} (${port.code})` : 'At sea or an unlisted port')
+const portName = (port) => (port ? `${port.name} (${port.code})` : 'At sea or unlisted port')
 const tonnes = (t) => (t ? `~${t.toLocaleString()} t` : '')
 
 // as a file to save: the user's own data, from their own server
@@ -27,7 +27,7 @@ function DraughtChart({ draughts, calls, from, to }) {
   const [hover, setHover] = useState(null)
   const [w, h, pad] = [640, 120, { left: 34, right: 8, top: 10, bottom: 20 }]
   if (draughts.length < 2) {
-    return <p className="rounded-lg border border-dashed border-slate-700 px-3 py-4 text-xs text-slate-400">No draught recorded yet: it fills in as the recorder runs, every 10 minutes.</p>
+    return <p className="rounded-lg border border-dashed border-slate-700 px-3 py-4 text-xs text-slate-400">No draught recorded yet. Recorded every 10 minutes while the app runs.</p>
   }
   const values = draughts.map(([, d]) => d)
   const [low, high] = [Math.floor(Math.min(...values) - 1), Math.ceil(Math.max(...values) + 1)]
@@ -95,7 +95,7 @@ function Stat({ label, value }) {
 
 function VesselHistory({ mmsi, history, remove, showOnMap }) {
   const [open, setOpen] = useState(null) // which table is unfolded
-  if (!history) return <li className="rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm text-slate-400">MMSI {mmsi}: loading</li>
+  if (!history) return <li className="rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm text-slate-400">MMSI {mmsi}: loading…</li>
   const { record, calls, voyages, gaps, draughts, track, since } = history
   const name = record.name || `MMSI ${mmsi}`
   // (unknown until there's draught enough to tell laden from ballast)
@@ -106,12 +106,12 @@ function VesselHistory({ mmsi, history, remove, showOnMap }) {
   const csv = () =>
     download(`${name} history.csv`, [
       ['Port calls'],
-      ['Port', 'Arrived', 'Left', 'Hours', 'At anchor', 'Draught in (m)', 'Draught out (m)', 'Event', 'Estimated cargo (t)', 'Source'],
+      ['Port', 'Arrived', 'Departed', 'Hours', 'At anchor', 'Arrival draught (m)', 'Departure draught (m)', 'Event', 'Estimated cargo (t)', 'Source'],
       ...calls.map((c) => [portName(c.port), moment(c.arrive), moment(c.depart), c.hours, c.anchored ? 'yes' : '', c.draughtIn, c.draughtOut, c.event, c.tonnes, c.source]),
       [],
       ['Voyages'],
-      ['From', 'To', 'Departed', 'Arrived', 'Miles', 'Days', 'Average knots', 'Laden'],
-      ...voyages.map((v) => [portName(v.from), portName(v.to), moment(v.depart), moment(v.arrive), v.miles, v.days, v.knots, v.laden === null ? '' : v.laden ? 'laden' : 'ballast']),
+      ['From', 'To', 'Departed', 'Arrived', 'Distance (nm)', 'Days', 'Average speed (kn)', 'Condition'],
+      ...voyages.map((v) => [portName(v.from), portName(v.to), moment(v.depart), moment(v.arrive), v.miles, v.days, v.knots, v.laden === null ? '' : v.laden ? 'Laden' : 'Ballast']),
     ])
   const table = (id, title, head, rows) => (
     <details open={open === id} onToggle={(e) => e.currentTarget.open && setOpen(id)}>
@@ -139,9 +139,9 @@ function VesselHistory({ mmsi, history, remove, showOnMap }) {
           <VesselFound vessel={{ ...record, mmsi }} />
           <p className="mt-1 text-xs text-slate-400">
             {record.sog !== undefined && `${record.sog} kn`}
-            {record.destination && `, for ${record.destination}`}
+            {record.destination && `, bound for ${record.destination}`}
             {record.draught && `, draught ${record.draught} m`}
-            {record.seen && `, last heard ${moment(Date.parse(record.seen) / 1000)}`}
+            {record.seen && `, last report ${moment(Date.parse(record.seen) / 1000)}`}
           </p>
         </div>
         <div className="flex shrink-0 gap-2 text-xs">
@@ -153,18 +153,18 @@ function VesselHistory({ mmsi, history, remove, showOnMap }) {
       <dl className="grid grid-cols-3 gap-3 sm:grid-cols-6">
         <Stat label="Port calls" value={calls.filter((c) => c.port).length} />
         <Stat label="Loads / discharges" value={`${loads} / ${discharges}`} />
-        <Stat label="Laden miles" value={miles(true)} />
-        <Stat label="Ballast miles" value={miles(false)} />
-        <Stat label="Hours at anchor" value={Math.round(anchored).toLocaleString()} />
-        <Stat label="Gaps over 12 h" value={gaps.length} />
+        <Stat label="Laden, nm" value={miles(true)} />
+        <Stat label="Ballast, nm" value={miles(false)} />
+        <Stat label="At anchor, h" value={Math.round(anchored).toLocaleString()} />
+        <Stat label="AIS gaps > 12 h" value={gaps.length} />
       </dl>
       <DraughtChart draughts={draughts} calls={calls} from={since ?? now} to={now} />
-      {table('calls', 'Port calls', ['Port', 'Arrived', 'Left', 'Hours', 'Draught', 'Event'], [...calls].reverse().map((c) => (
+      {table('calls', 'Port calls', ['Port', 'Arrived', 'Departed', 'Hours', 'Draught', 'Event'], [...calls].reverse().map((c) => (
         <tr key={c.arrive} className="border-t border-slate-800">
           <td className="px-2 py-1">
             {portName(c.port)}
             {c.anchored && <span className="text-slate-400"> at anchor</span>}
-            <span className="ml-1 rounded bg-slate-800 px-1 text-[10px] text-slate-400" title={c.source === 'GFW' ? 'From Global Fishing Watch' : 'Worked out from AIS reports'}>{c.source ?? 'AIS'}</span>
+            <span className="ml-1 rounded bg-slate-800 px-1 text-[10px] text-slate-400" title={c.source === 'GFW' ? 'Source: Global Fishing Watch' : 'Derived from AIS reports'}>{c.source ?? 'AIS'}</span>
           </td>
           <td className="px-2 py-1">{moment(c.arrive)}</td>
           <td className="px-2 py-1">{moment(c.depart)}</td>
@@ -173,7 +173,7 @@ function VesselHistory({ mmsi, history, remove, showOnMap }) {
           <td className="px-2 py-1">{c.event ? `${c.event === 'load' ? '▲ Load' : '▼ Discharge'} ${tonnes(c.tonnes)}` : ''}</td>
         </tr>
       )))}
-      {table('voyages', 'Voyages', ['From', 'To', 'Departed', 'Days', 'Miles', 'Avg kn', ''], [...voyages].reverse().map((v) => (
+      {table('voyages', 'Voyages', ['From', 'To', 'Departed', 'Days', 'Distance, nm', 'Avg speed, kn', ''], [...voyages].reverse().map((v) => (
         <tr key={v.depart} className="border-t border-slate-800">
           <td className="px-2 py-1">{portName(v.from)}</td>
           <td className="px-2 py-1">{portName(v.to)}</td>
@@ -181,11 +181,11 @@ function VesselHistory({ mmsi, history, remove, showOnMap }) {
           <td className="px-2 py-1">{v.days}</td>
           <td className="px-2 py-1">{v.miles.toLocaleString()}</td>
           <td className="px-2 py-1">{v.knots ?? ''}</td>
-          <td className="px-2 py-1 text-slate-400">{v.laden === null ? '' : v.laden ? 'laden' : 'ballast'}</td>
+          <td className="px-2 py-1 text-slate-400">{v.laden === null ? '' : v.laden ? 'Laden' : 'Ballast'}</td>
         </tr>
       )))}
       <p className="text-[11px] text-slate-500">
-        {history.reports.toLocaleString()} reports since {since ? day(since) : 'now'}. Tracks before recording began come with no draught.
+        {history.reports.toLocaleString()} AIS reports since {since ? day(since) : 'now'}. Tracks before recording started have no draught data.
       </p>
     </li>
   )
@@ -208,7 +208,7 @@ function AddVessel({ add, full }) {
         type="search"
         disabled={full}
         aria-label="Add a vessel by name or MMSI"
-        placeholder={full ? `A fleet holds ${MOST} vessels at most` : 'Add a vessel: name or MMSI, then Enter'}
+        placeholder={full ? `Fleet limit reached (${MOST} vessels)` : 'Add vessel: name or MMSI, then Enter'}
         value={query}
         onChange={(e) => {
           setQuery(e.target.value)
@@ -218,7 +218,7 @@ function AddVessel({ add, full }) {
       />
       {found && (
         <ul className="absolute top-full right-0 left-0 z-10 mt-1 max-h-80 overflow-auto rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl">
-          {found.length === 0 && <li className="px-3 py-2 text-sm text-slate-400">Searching, or nothing found</li>}
+          {found.length === 0 && <li className="px-3 py-2 text-sm text-slate-400">Searching… No results yet.</li>}
           {found.map((v) => (
             <li key={v.mmsi}>
               <button
@@ -245,12 +245,12 @@ const ARCHIVES = [
   {
     id: 'us',
     name: 'US waters, 2021–2025',
-    about: 'NOAA MarineCadastre: every report in US waters a minute apart, with draught. About 80 GB a year to download, read as it comes and all but your vessels thrown away.',
+    about: 'NOAA MarineCadastre: all AIS reports in US waters at 1-minute intervals, with draught. About 80 GB per year to download; only fleet vessels are kept.',
   },
   {
     id: 'dk',
     name: 'Danish waters, from 2021',
-    about: "Danish Maritime Authority: every report in Danish waters, with draught, destination and ETA. About 220 GB a year to download, a day at a time, each deleted once it's read.",
+    about: 'Danish Maritime Authority: all AIS reports in Danish waters, with draught, destination and ETA. About 220 GB per year to download, one day at a time; each file is deleted after reading.',
   },
 ]
 
@@ -267,9 +267,9 @@ function Sources({ hasVessels }) {
     try {
       const res = await fetch(path, options)
       if (res.ok) setState(await res.json())
-      else setProblem((await res.json().catch(() => null))?.detail ?? `Couldn't: ${res.status}`)
+      else setProblem((await res.json().catch(() => null))?.detail ?? `Request failed (${res.status})`)
     } catch {
-      setProblem("The app's server can't be reached just now") // (and asked again in a few seconds)
+      setProblem('Server could not be reached. Retrying…') // (and asked again in a few seconds)
     }
   }
   useEffect(() => {
@@ -291,17 +291,17 @@ function Sources({ hasVessels }) {
 
   return (
     <details className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-      <summary className="cursor-pointer text-sm font-medium text-slate-200">History sources: free, beyond the recorder</summary>
+      <summary className="cursor-pointer text-sm font-medium text-slate-200">Additional history sources (free)</summary>
       <div className="mt-3 flex flex-col gap-4 text-sm">
         <section className="flex flex-col gap-2">
-          <h2 className="font-medium">Global Fishing Watch port visits, worldwide, from 2017</h2>
+          <h2 className="font-medium">Global Fishing Watch port visits (worldwide, from 2017)</h2>
           <p className="text-xs text-slate-400">
-            When and where each vessel called, anywhere, for all vessel types; no draught. Free for non-commercial use (CC BY-NC
-            4.0), with a token of your own from{' '}
+            Port call times and locations worldwide for all vessel types; no draught. Free for non-commercial use (CC BY-NC
+            4.0); requires a personal token from{' '}
             <a href="https://globalfishingwatch.org/our-apis/tokens" target="_blank" rel="noreferrer" className="underline hover:text-cyan-300">
               globalfishingwatch.org/our-apis/tokens
             </a>
-            . It's kept on this computer only, and fills in new vessels by itself.
+            . The token is stored on this computer only. New vessels are filled in automatically.
           </p>
           <form
             onSubmit={(e) => {
@@ -316,13 +316,13 @@ function Sources({ hasVessels }) {
               value={token}
               onChange={(e) => setToken(e.target.value)}
               aria-label="Global Fishing Watch token"
-              placeholder={state?.gfwToken ? 'Token saved: paste a new one to replace it' : 'Paste your token'}
+              placeholder={state?.gfwToken ? 'Token saved. Paste a new token to replace it.' : 'Paste token'}
               autoComplete="off"
               className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 focus:border-cyan-400"
             />
             <button type="submit" disabled={!token.trim()} className={button}>Save token</button>
             <button type="button" disabled={!state?.gfwToken || running || !hasVessels} onClick={() => ask('/api/fleet/backfill/gfw', { method: 'POST' })} className={button}>
-              Fill in port visits
+              Import port visits
             </button>
           </form>
           {status('gfw') && <p className="text-xs text-slate-300">{status('gfw')}</p>}
@@ -330,16 +330,16 @@ function Sources({ hasVessels }) {
         {ARCHIVES.map((a) => (
           <section key={a.id} className="flex flex-col gap-2">
             <h2 className="font-medium">{a.name}</h2>
-            <p className="text-xs text-slate-400">{a.about} Newest first; stop any time, and it picks up where it left off.</p>
+            <p className="text-xs text-slate-400">{a.about} Newest data first. Can be stopped and resumed.</p>
             <div className="flex flex-wrap items-center gap-2">
               <label className="flex items-center gap-2 text-xs text-slate-300">
-                Years back
+                Years to import
                 <select value={years} onChange={(e) => setYears(+e.target.value)} className="rounded border border-slate-700 bg-slate-950 px-1 py-1">
                   {[1, 2, 3, 4, 5].map((n) => <option key={n}>{n}</option>)}
                 </select>
               </label>
               <button type="button" disabled={running || !hasVessels} onClick={() => ask(`/api/fleet/backfill/${a.id}?years=${years}`, { method: 'POST' })} className={button}>
-                Fill in from this archive
+                Import from archive
               </button>
               {run(a.id)?.running && (
                 <button type="button" onClick={() => ask('/api/fleet/backfill-stop', { method: 'POST' })} className="rounded-lg px-2 py-1.5 text-sm text-slate-300 hover:text-red-300">
@@ -351,8 +351,8 @@ function Sources({ hasVessels }) {
           </section>
         ))}
         <p className="text-xs text-slate-400">
-          One runs at a time. Add your vessels first: those added after a run need a run of their own. At about 1 MB/s, a year of
-          the US archive takes most of a day, and of the Danish one two or three days.
+          One import runs at a time. Add vessels first; vessels added later need a separate run. At about 1 MB/s, one year takes
+          most of a day (US archive) or 2–3 days (Danish archive).
         </p>
         {problem && <p className="text-xs text-amber-300">{problem}</p>}
       </div>
@@ -433,16 +433,16 @@ export function FleetView({ showTrack }) {
             }}
             className="flex gap-2 text-sm"
           >
-            <input value={naming} onChange={(e) => setNaming(e.target.value)} aria-label="New fleet's name" placeholder="New fleet's name" maxLength={80} className="w-40 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 focus:border-cyan-400" />
+            <input value={naming} onChange={(e) => setNaming(e.target.value)} aria-label="New fleet name" placeholder="New fleet name" maxLength={80} className="w-40 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 focus:border-cyan-400" />
             <button type="submit" className="rounded-lg bg-slate-800 px-3 py-1.5 text-cyan-300 hover:bg-slate-700">New fleet</button>
           </form>
           {current && <button type="button" onClick={remove} className="rounded-lg px-2 py-1.5 text-sm text-slate-400 hover:text-red-300">Delete fleet</button>}
         </header>
         <p className="text-xs text-slate-400">
-          Each vessel is recorded from Open Waters every 10 minutes while the app runs, with its tracks back to about October
-          2025 filled in when it's added. Those older tracks carry no draught, so loads and discharges show from when
-          recording began. More history can be filled in from the free sources below. Ports, voyages and cargo are worked out
-          from the reports: a guess, not the ship's papers, good for crude tankers, rougher for product tankers.
+          Each vessel is recorded from Open Waters AIS every 10 minutes while the app runs. When a vessel is added, tracks back to about
+          October 2025 are filled in without draught, so loads and discharges are shown from the start of
+          recording. More history can be imported from the free sources below. Port calls, voyages and cargo are estimated
+          from AIS reports, not from vessel documents: reliable for crude tankers, less so for product tankers.
         </p>
         {current ? (
           <>
@@ -459,10 +459,10 @@ export function FleetView({ showTrack }) {
                 />
               ))}
             </ol>
-            {!mmsis.length && <p className="text-sm text-slate-400">No vessels yet: add up to {MOST} above.</p>}
+            {!mmsis.length && <p className="text-sm text-slate-400">No vessels. Add up to {MOST} above.</p>}
           </>
         ) : (
-          <p className="text-sm text-slate-400">Start a fleet: give it a name above, then add vessels to it.</p>
+          <p className="text-sm text-slate-400">No fleet selected. Enter a fleet name above, then add vessels.</p>
         )}
       </div>
     </main>

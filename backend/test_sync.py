@@ -53,7 +53,7 @@ assert len(catalog.charts) < len(files) < 2 * len(catalog.charts)
 def view(west: float, south: float, east: float, north: float, corners: str | None = None) -> dict:
     corners = corners or f"{west},{north},{east},{north},{east},{south},{west},{south}"
     params = {"west": west, "south": south, "east": east, "north": north, "tier": 5, "corners": corners, "zoom": 10}
-    return TestClient(main.app).get("/api/view", params=params).json()
+    return TestClient(main.app, base_url="http://127.0.0.1").get("/api/view", params=params).json()
 
 
 # a view knows whether it holds any ENC: Boston does, Denver doesn't
@@ -80,7 +80,7 @@ assert across["charted"]
 assert main.places_from([{"display_name": "Freeport", "boundingbox": ["26.4", "26.6", "-78.8", "-78.6"]}]) == [
     {"name": "Freeport", "bounds": [-78.8, 26.4, -78.6, 26.6]}
 ]
-long_query = TestClient(main.app).get("/api/search", params={"q": "x" * 201})
+long_query = TestClient(main.app, base_url="http://127.0.0.1").get("/api/search", params={"q": "x" * 201})
 assert long_query.status_code == 422
 
 # Freeport's only chart is at 1:700,000: an ENC, but its coast is too rough to stand buildings on; Victoria's will do
@@ -199,7 +199,7 @@ with tempfile.TemporaryDirectory() as tmp:
     sync.catalog = sync.Catalog([])
     sync.on_disk.clear()
     sync.check()
-    assert "Can't reach NOAA" in sync.status["problem"] and sync.status["phase"] == "idle"
+    assert "NOAA could not be reached" in sync.status["problem"] and sync.status["phase"] == "idle"
     assert sync.catalog.charts == [] and sync.status["ready"], "stuck on the loading screen"
     (Path(tmp) / "ENCProdCat.xml").write_text(ONE_CELL)
     sync.check()
@@ -207,7 +207,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # the user's own charts join the catalog, last through a restart, and give NOAA's back when removed
 real = Path(__file__).parent.parent / "enc/ENC_ROOT/US5BOSCD/US5BOSCD.000"
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://127.0.0.1")
 assert sync.Chart("GBX", 12000, (1, 0), None, None, "").band == 5, "a cell not named by its band"
 with tempfile.TemporaryDirectory() as tmp:
     sync.UPLOADS, sync.ENC, sync.noaa = Path(tmp) / "uploads", Path(tmp) / "ENC_ROOT", []

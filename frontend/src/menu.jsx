@@ -52,7 +52,7 @@ export function SideMenu({ menus }) {
             {m.alert && (
               <>
                 <span className="absolute top-1 right-2 size-2 rounded-full bg-amber-400" aria-hidden="true" />
-                <span className="sr-only">, needs a look</span>
+                <span className="sr-only">, attention required</span>
               </>
             )}
           </button>
@@ -69,7 +69,7 @@ export function SideMenu({ menus }) {
         >
           <header className="flex items-center justify-between gap-2">
             <h2 className="text-base font-semibold">{menu?.title}</h2>
-            <button type="button" aria-label="Close the menu" onClick={() => setOpen(null)} className="grid size-7 shrink-0 place-items-center rounded-md text-lg leading-none text-slate-300 hover:bg-slate-800 hover:text-cyan-300">
+            <button type="button" aria-label="Close menu" onClick={() => setOpen(null)} className="grid size-7 shrink-0 place-items-center rounded-md text-lg leading-none text-slate-300 hover:bg-slate-800 hover:text-cyan-300">
               ×
             </button>
           </header>

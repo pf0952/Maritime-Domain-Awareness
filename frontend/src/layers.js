@@ -158,7 +158,7 @@ const { boxes, dots } = warningSet
     data: ticks,
     visible: ticks.length > 0,
     getPosition: (tick) => tick.position,
-    getText: (tick) => (tick.hours % 24 ? `+${tick.hours} h` : `day ${tick.hours / 24}`),
+    getText: (tick) => (tick.hours % 24 ? `+${tick.hours} h` : `Day ${tick.hours / 24}`),
     getSize: 11,
     getColor: [207, 250, 254],
     getPixelOffset: [0, -12],
@@ -201,6 +201,16 @@ const { boxes, dots } = warningSet
     getColor: [...ROUTE_RGB, 235],
     parameters: { depthCompare: 'always', depthWriteEnabled: false },
   })
+  const routeOptions = new PathLayer({
+    id: 'route-options',
+    data: routeData.options,
+    visible: routeData.options.length > 0,
+    getPath: (o) => o.waypoints,
+    getWidth: 2.5,
+    widthUnits: 'pixels',
+    getColor: (o) => [...o.rgb, 220],
+    parameters: { depthCompare: 'always', depthWriteEnabled: false },
+  })
   const routePoints = new ScatterplotLayer({
     id: 'route-waypoints',
     data: routeData.waypoints,
@@ -230,7 +240,7 @@ const { boxes, dots } = warningSet
   const findingDots = new ScatterplotLayer({
     id: 'route-findings',
     data: findingData,
-    visible: !!findings?.length || planEnds.length > 0,
+    visible: findingData.length > 0,
     radiusUnits: 'pixels',
     getPosition: (f) => f.position,
     getRadius: 5,
@@ -286,6 +296,7 @@ const { boxes, dots } = warningSet
       measureLabels,
       routePaths,
       findingDots,
+      routeOptions,
       routePoints,
       routeLabels,
     ].filter(Boolean)

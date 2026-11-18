@@ -32,8 +32,10 @@ FIELDS = {
     # the sea all told, then its two parts: waves the wind is raising here, and swell come from far off
     SEA_URL: {
         "wave_height": "wave", "wave_direction": "waveFrom", "wave_period": "period",
-        "wind_wave_height": "sea", "wind_wave_direction": "seaFrom",
+        "wind_wave_height": "sea", "wind_wave_direction": "seaFrom", "wind_wave_period": "seaPeriod",
         "swell_wave_height": "swell", "swell_wave_direction": "swellFrom", "swell_wave_period": "swellPeriod",
+        # (in knots, as the wind's asked for: flowing toward the direction given)
+        "ocean_current_velocity": "current", "ocean_current_direction": "currentTo",
     },
 }
 

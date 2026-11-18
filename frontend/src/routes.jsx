@@ -77,7 +77,7 @@ export function readRoute(fileName, text) {
 
 const xml = (text) => {
   const doc = new DOMParser().parseFromString(text, 'application/xml')
-  if (doc.querySelector('parsererror')) throw new Error("It isn't well-formed XML")
+  if (doc.querySelector('parsererror')) throw new Error('not valid XML')
   return doc
 }
 const all = (node, name) => [...node.getElementsByTagNameNS('*', name)]
@@ -125,7 +125,7 @@ function readGpx(fileName, text) {
 // lon pairs. Degrees as decimals, or as degrees and minutes ("40 41.5 N")
 function readCsv(fileName, text) {
   const rows = text.split(/\r?\n/).map((line) => line.split(/[,;\t]/).map((cell) => cell.trim().replace(/^"|"$/g, ''))).filter((row) => row.some(Boolean))
-  if (!rows.length) throw new Error('The file is empty')
+  if (!rows.length) throw new Error('file is empty')
   const header = rows[0].map((h) => h.toLowerCase())
   const column = (...names) => header.findIndex((h) => names.includes(h))
   let [lat, lon, name, speed, leg] = [column('lat', 'latitude'), column('lon', 'lng', 'long', 'longitude'), column('name', 'waypoint', 'wp'), column('speed', 'sog', 'knots'), column('leg', 'geometry', 'sailing')]
@@ -133,7 +133,7 @@ function readCsv(fileName, text) {
   if (lat < 0 || lon < 0) [lat, lon] = [0, 1]
   const waypoints = body.map((row, i) => {
     const point = { lat: degrees(row[lat]), lng: degrees(row[lon]) }
-    if (point.lat == null || point.lng == null) throw new Error(`Row ${i + 1} has no position that can be read`)
+    if (point.lat == null || point.lng == null) throw new Error(`row ${i + 1}: position not readable`)
     return { ...point, name: (name >= 0 && row[name]) || `WP${i + 1}`, leg: { geometry: /^(gc|great|orthodrome)/i.test(row[leg] ?? '') ? 'great' : 'rhumb', speed: number(row[speed]) ?? undefined } }
   })
   return { ...newRoute(nameOf(fileName)), waypoints }
@@ -190,7 +190,7 @@ ${points}
 export function writeGpx(route) {
   const points = route.waypoints.map((w, i) => `    <rtept lat="${w.lat.toFixed(6)}" lon="${w.lng.toFixed(6)}"><name>${escape(w.name || `WP${i + 1}`)}</name></rtept>`).join('\n')
   return `<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="ENC 3D" xmlns="http://www.topografix.com/GPX/1/1">
+<gpx version="1.1" creator="Mariner Domain Awareness" xmlns="http://www.topografix.com/GPX/1/1">
   <rte>
     <name>${escape(route.name)}</name>
 ${points}
@@ -221,6 +221,8 @@ function download(fileName, text, type) {
 
 const input = 'rounded border border-slate-700 bg-slate-950 px-1.5 py-1 focus:border-orange-400'
 const button = 'rounded-lg bg-slate-800 px-2.5 py-1.5 font-medium text-orange-200 hover:bg-slate-700 disabled:opacity-40'
+// the weather routing options' colours on the map: the route as planned keeps the route's orange
+export const OPTION_RGB = { 'Planned route': [251, 146, 60], Fastest: [167, 139, 250], 'Least motion': [52, 211, 153] }
 const SEVERITY = { danger: 'text-red-300', caution: 'text-amber-200', info: 'text-sky-300' }
 const course = (deg) => `${String(Math.round(deg) % 360).padStart(3, '0')}°`
 const localTime = (ms) => new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
@@ -234,6 +236,12 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
   const [kept, setKept] = useState({})
   const [busy, setBusy] = useState('')
   const [problem, setProblem] = useState('')
+  const [ports, setPorts] = useState({ from: null, to: null })
+  const [portText, setPortText] = useState({ from: '', to: '' })
+  const [portHits, setPortHits] = useState([])
+  const [vesselList, setVesselList] = useState([])
+  const [voyage, setVoyage] = useState(null) // the route sailed through the forecast (backend/routes.py voyage)
+  const endNames = useRef(['Start', 'End'])
   const file = useRef(null)
   const legs = legsOf(route)
   const total = legs.reduce((sum, leg) => sum + leg.nm, 0)
@@ -249,24 +257,114 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
       .then((res) => (res.ok ? res.json() : {}))
       .then(setKept)
       .catch(() => {})
+    const vessels = () =>
+      fetch('/api/vessels')
+        .then((res) => (res.ok ? res.json() : []))
+        .then(setVesselList)
+        .catch(() => {})
+    vessels()
+    // (a vessel saved or deleted in the Vessel tab: the list kept up to date)
+    window.addEventListener('vessels-changed', vessels)
+    return () => window.removeEventListener('vessels-changed', vessels)
   }, [])
+  // a forecast passage is for the route as it was: any change, and it's asked for again
+  useEffect(() => setVoyage(null), [route.waypoints, route.speed, route.departure])
+
+  // ports as they're typed, for the lists under the boxes
+  const findPorts = async (which, text) => {
+    setPortText((t) => ({ ...t, [which]: text }))
+    setPorts((p) => ({ ...p, [which]: null }))
+    if (text.trim().length < 2) return setPortHits([])
+    // (one picked from the list reads "Name (CODE)": looked up by its code)
+    const res = await fetch(`/api/ports?q=${encodeURIComponent(text.match(/\(([^()]+)\)$/)?.[1] ?? text)}`).catch(() => null)
+    const hits = res?.ok ? await res.json() : []
+    setPortHits(hits)
+    const exact = hits.find((h) => `${h.name} (${h.code})` === text)
+    if (exact) setPorts((p) => ({ ...p, [which]: exact }))
+  }
+  // from one port's sea buoy (or pilot boarding place) to the other's, through the charts and the lanes
+  const planPorts = () =>
+    run('Finding port approaches…', async () => {
+      const ends = []
+      for (const port of [ports.from, ports.to]) {
+        const res = await fetch(`/api/ports/approach?lng=${port.lng}&lat=${port.lat}`)
+        if (!res.ok) throw new Error((await res.json()).detail)
+        const a = await res.json()
+        ends.push(a)
+      }
+      endNames.current = ends.map((a, i) => {
+        const port = i ? ports.to : ports.from
+        return a.kind === 'port' ? port.name : `${port.name} ${a.kind === 'pilot boarding place' ? 'pilot boarding' : 'sea buoy'}`
+      })
+      setPlanEnds(ends.map((a) => [a.lng, a.lat]))
+    })
+  // My vessel: her draught and the motions' figures, as her stability report gives them (nothing worked out here)
+  const useVessel = (id) =>
+    run('Loading vessel…', async () => {
+      if (!id) return set({ myVessel: null })
+      const v = await fetch(`/api/vessels/${id}`).then((r) => r.json())
+      const f = v.report.figures
+      const draught = Math.max(f.draught_aft ?? 0, f.draught_fwd ?? 0, f.draught_mid ?? 0)
+      // the heaviest cargo, for the accelerations at their places
+      const cargo = [...v.stow].filter((u) => u.lcg != null && u.vcg != null).sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0)).slice(0, 12)
+        .map((u) => ({ name: u.name || 'Cargo', x: u.lcg, y: u.tcg ?? 0, z: u.vcg }))
+      set({
+        vessel: { ...route.vessel, ...(draught ? { draught: +draught.toFixed(2) } : {}), ...(f.air_draught ? { air_draught: f.air_draught } : {}) },
+        myVessel: { id: v.id, name: v.name, lbp: v.principal.lbp, beam: v.principal.breadth, depth: v.principal.depth, draught: f.draught_mid ?? draught,
+          gm: f.gm, kg: f.kg, roll_period: f.roll_period, displacement: f.displacement, lcf: v.principal.lbp / 2, cargo },
+      })
+    })
+  const sail = () =>
+    run('Calculating forecast ETA…', async () => {
+      const res = await fetch('/api/routes/voyage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route: { ...route, weather: undefined, passage: undefined, departure: route.departure != null ? route.departure / 1000 : null }, vessel: { length: route.myVessel?.lbp ?? 150, my: route.myVessel } }),
+      })
+      if (!res.ok) throw new Error((await res.json()).detail ?? 'Forecast could not be loaded')
+      const v = await res.json()
+      setVoyage(v)
+      if (route.myVessel) setRoute((now) => ({ ...now, passage: { name: 'Planned route', timeline: v.timeline, for: now.waypoints } }))
+    })
+  // weather routing: the fastest and the most comfortable ways through the forecast, beside the route as planned
+  const weatherRoute = () =>
+    run('Calculating weather routes (about 1 min)…', async () => {
+      const res = await fetch('/api/routes/weather', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route: { ...route, weather: undefined, passage: undefined, departure: route.departure != null ? route.departure / 1000 : null }, my: route.myVessel ?? {} }),
+      })
+      if (!res.ok) throw new Error((await res.json()).detail ?? 'Forecast could not be loaded')
+      const w = await res.json()
+      setRoute((now) => ({ ...now, weather: { options: w.options.map((o) => ({ ...o, rgb: OPTION_RGB[o.name] })), note: w.note } }))
+    })
+  const adopt = (o) =>
+    setRoute((now) => {
+      const waypoints =
+        o.name === 'Planned route'
+          ? now.waypoints
+          : o.waypoints.map(([lng, lat], i, all) => ({ lng, lat, name: i === 0 ? now.waypoints[0]?.name : i === all.length - 1 ? now.waypoints.at(-1)?.name : `WR${i}`, leg: { geometry: 'rhumb' } }))
+      return { ...now, waypoints, passage: o.timeline[0]?.motion ? { name: o.name, timeline: o.timeline, for: waypoints } : now.passage }
+    })
 
   // once both ends are clicked, ask for a route between them
   useEffect(() => {
     if (planEnds.length < 2) return
     setMode(null)
-    run('Planning a route through the charts…', async () => {
+    run('Planning route…', async () => {
       const res = await fetch('/api/routes/plan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ start: planEnds[0], end: planEnds[1], vessel: vesselFor(route.vessel), xtd: +route.xtd || ROUTE_XTD }),
       })
-      if (!res.ok) throw new Error((await res.json()).detail ?? 'The plan failed')
+      if (!res.ok) throw new Error((await res.json()).detail ?? 'Route could not be planned')
       const { waypoints, notes } = await res.json()
-      setRoute((now) => ({ ...now, waypoints: waypoints.map(([lng, lat], i) => ({ lng, lat, name: i === 0 ? 'Start' : i === waypoints.length - 1 ? 'End' : `WP${i}`, leg: { geometry: 'rhumb' } })) }))
+      const [first, last] = endNames.current
+      endNames.current = ['Start', 'End']
+      setRoute((now) => ({ ...now, waypoints: waypoints.map(([lng, lat], i) => ({ lng, lat, name: i === 0 ? first : i === waypoints.length - 1 ? last : `WP${i}`, leg: { geometry: 'rhumb' } })) }))
       setFindings(null)
       setPlanEnds([])
-      if (notes.length) setProblem(notes.join('. '))
+      if (notes.length) setProblem(notes.map((n) => `${n}.`).join(' '))
     })
   }, [planEnds])
 
@@ -283,19 +381,19 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
 
   const vesselFor = (v) => ({ draught: +v.draught || 0, ukc: +v.ukc || 0, air_draught: v.air_draught === '' || v.air_draught == null ? null : +v.air_draught })
   const check = () =>
-    run('Checking each leg against the charts and tides…', async () => {
+    run('Checking route…', async () => {
       const res = await fetch('/api/routes/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...route, departure: route.departure != null ? route.departure / 1000 : null, vessel: vesselFor(route.vessel) }),
       })
-      if (!res.ok) throw new Error((await res.json()).detail ?? 'The check failed')
+      if (!res.ok) throw new Error((await res.json()).detail ?? 'Route check failed')
       setFindings(await res.json())
     })
   const save = () =>
     run('Saving…', async () => {
-      const res = await fetch(`/api/routes/${encodeURIComponent(route.name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(route) })
-      if (!res.ok) throw new Error((await res.json()).detail ?? "It couldn't be saved")
+      const res = await fetch(`/api/routes/${encodeURIComponent(route.name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...route, weather: undefined, passage: undefined }) })
+      if (!res.ok) throw new Error((await res.json()).detail ?? 'Route could not be saved')
       setKept(await res.json())
     })
   const remove = (name) =>
@@ -315,10 +413,10 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
     if (!chosen) return
     try {
       const read = readRoute(chosen.name, await chosen.text())
-      if (read.waypoints.length < 2) throw new Error('It has fewer than two waypoints')
+      if (read.waypoints.length < 2) throw new Error('fewer than two waypoints')
       open(read)
     } catch (err) {
-      setProblem(`${chosen.name} couldn't be read: ${err.message}`)
+      setProblem(`${chosen.name} could not be imported: ${err.message}`)
     }
   }
   const safeName = route.name.replace(/[^\w .-]+/g, '_') || 'route'
@@ -336,7 +434,7 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
         </div>
         <div className="flex flex-wrap gap-2">
           <button type="button" aria-pressed={mode === 'edit'} className={mode === 'edit' ? 'rounded-lg bg-orange-300 px-2.5 py-1.5 font-medium text-slate-900' : button} onClick={() => setMode(mode === 'edit' ? null : 'edit')}>
-            {mode === 'edit' ? 'Done' : 'Lay on the map'}
+            {mode === 'edit' ? 'Done' : 'Draw on map'}
           </button>
           <button
             type="button"
@@ -347,10 +445,10 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
               setMode(mode === 'plan' ? null : 'plan')
             }}
           >
-            {mode === 'plan' ? 'Cancel plan' : 'Plan from A to B'}
+            {mode === 'plan' ? 'Cancel' : 'Plan route'}
           </button>
           <button type="button" className={button} disabled={route.waypoints.length < 2 || !!busy} onClick={check}>
-            Check
+            Check route
           </button>
           <button type="button" className={button} disabled={route.waypoints.length < 2 || !route.name.trim() || !!busy} onClick={save}>
             Save
@@ -358,15 +456,54 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
         </div>
         <p className={note}>
           {mode === 'edit'
-            ? 'Click to add a waypoint, on a leg to put one in it. Drag a waypoint to move it; pick one, then Delete to take it out.'
+            ? 'Click to add a waypoint; click a leg to insert one. Drag a waypoint to move it. Select a waypoint, then Delete to remove it.'
             : mode === 'plan'
               ? planEnds.length
-                ? 'Now click where it ends.'
-                : 'Click where the route starts.'
-              : 'Plan lays a first route through water deep enough for the draught and clearance below: edit it after.'}
+                ? 'Click the end point.'
+                : 'Click the start point.'
+              : 'Plan route lays a draft route in water deeper than draught plus UKC. Review and edit before use.'}
         </p>
         {busy && <p className="text-xs text-orange-200">{busy}</p>}
         {problem && <p className="text-xs text-amber-200">{problem}</p>}
+      </section>
+
+      <section className="flex flex-col gap-2 text-xs" aria-label="Port to port">
+        <h3 className="font-medium text-slate-300">Port to port</h3>
+        <datalist id="route-ports">
+          {portHits.map((h) => (
+            <option key={h.code} value={`${h.name} (${h.code})`} />
+          ))}
+        </datalist>
+        <div className="grid grid-cols-2 gap-2">
+          {['from', 'to'].map((which) => (
+            <label key={which} className="flex flex-col gap-0.5 text-slate-400">
+              {which === 'from' ? 'From' : 'To'}
+              <input list="route-ports" value={portText[which]} onChange={(e) => findPorts(which, e.target.value)} placeholder="Port name or code" className={`${input} text-slate-100`} />
+            </label>
+          ))}
+        </div>
+        <button type="button" className={`${button} self-start`} disabled={!ports.from || !ports.to || !!busy} onClick={planPorts}>
+          Plan port to port
+        </button>
+        <p className={note}>Starts and ends at each port&apos;s charted pilot boarding place or outermost fairway buoy.</p>
+      </section>
+
+      <section className="flex flex-col gap-2 text-xs" aria-label="Own vessel">
+        <h3 className="font-medium text-slate-300">Own vessel</h3>
+        <div className="grid grid-cols-2 gap-2">
+          <select value={route.myVessel?.id ?? ''} onChange={(e) => useVessel(e.target.value)} aria-label="Own vessel" className={`${input} col-span-2 text-slate-100`}>
+            <option value="">None</option>
+            {vesselList.map((v) => (
+              <option key={v.id} value={v.id}>{v.name}</option>
+            ))}
+          </select>
+        </div>
+        {route.myVessel && (
+          <p className="text-slate-400 tabular-nums">
+            {route.myVessel.name} (stability report): draught {route.vessel.draught} m, GM {route.myVessel.gm?.toFixed(2) ?? '–'} m
+            {route.myVessel.roll_period ? `, roll period ${route.myVessel.roll_period.toFixed(0)} s` : ''}
+          </p>
+        )}
       </section>
 
       <section className="flex flex-col gap-2" aria-label="Vessel and passage">
@@ -376,7 +513,7 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
             <input type="number" min="0" step="0.1" value={route.vessel.draught} onChange={(e) => setVessel({ draught: e.target.value })} className={`${input} text-slate-100`} />
           </label>
           <label className="flex flex-col gap-0.5 text-slate-400">
-            Under keel, m
+            UKC, m
             <input type="number" min="0" step="0.1" value={route.vessel.ukc} onChange={(e) => setVessel({ ukc: e.target.value })} className={`${input} text-slate-100`} />
           </label>
           <label className="flex flex-col gap-0.5 text-slate-400">
@@ -418,12 +555,12 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
                     <button type="button" className="max-w-20 truncate text-left hover:text-orange-200" onClick={() => (setPicked(leg.index), goTo([leg.to.lng, leg.to.lat]))}>
                       {leg.to.name || `WP${leg.index + 1}`}
                     </button>
-                    {byLeg[leg.index - 1]?.length > 0 && <span className={`ml-1 ${SEVERITY[byLeg[leg.index - 1][0].severity]}`} aria-label="has findings">●</span>}
+                    {byLeg[leg.index - 1]?.length > 0 && <span className={`ml-1 ${SEVERITY[byLeg[leg.index - 1][0].severity]}`} aria-label="Has findings">●</span>}
                   </td>
                   <td>{course(leg.bearing)}</td>
                   <td className="text-right">{leg.nm.toFixed(1)}</td>
                   <td>
-                    <select value={leg.great ? 'great' : 'rhumb'} onChange={(e) => setLeg(leg.index, { geometry: e.target.value })} aria-label="How the leg is sailed" className="bg-transparent">
+                    <select value={leg.great ? 'great' : 'rhumb'} onChange={(e) => setLeg(leg.index, { geometry: e.target.value })} aria-label="Sailing" className="bg-transparent">
                       <option value="rhumb">RL</option>
                       <option value="great">GC</option>
                     </select>
@@ -431,7 +568,11 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
                   <td>
                     <input type="number" min="0.5" step="0.5" value={leg.to.leg?.speed ?? ''} placeholder={String(route.speed)} onChange={(e) => setLeg(leg.index, { speed: e.target.value ? +e.target.value : undefined })} aria-label="Leg speed" className="w-10 bg-transparent" />
                   </td>
-                  <td className="text-right">{leg.eta ? localTime(leg.eta) : '–'}</td>
+                  <td className="text-right" title={voyage ? `Forecast SOG ${voyage.legs[leg.index - 1]?.speed} kn, speed loss in waves ${voyage.legs[leg.index - 1]?.loss_pct} %` : ''}>
+                    {voyage?.legs[leg.index - 1] ? (
+                      <span className={voyage.legs[leg.index - 1].beyond_forecast ? 'text-slate-400' : 'text-sky-200'}>{localTime(voyage.legs[leg.index - 1].arrive * 1000)}</span>
+                    ) : leg.eta ? localTime(leg.eta) : '–'}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -440,7 +581,11 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
             <span>
               {route.waypoints.length} waypoints, {total.toFixed(1)} nm
             </span>
-            <span>{legs.at(-1)?.eta ? `Arrives ${localTime(legs.at(-1).eta)}` : `${(legs.reduce((h, l) => h + l.nm / l.speed, 0)).toFixed(1)} h underway`}</span>
+            <span>
+              {voyage
+                ? `Forecast ETA ${localTime(voyage.arrival * 1000)}, ${((voyage.arrival - voyage.departure) / 3600).toFixed(1)} h`
+                : legs.at(-1)?.eta ? `ETA ${localTime(legs.at(-1).eta)}` : `Passage time ${(legs.reduce((h, l) => h + l.nm / l.speed, 0)).toFixed(1)} h`}
+            </span>
           </p>
           {picked != null && route.waypoints[picked] && (
             <div className="flex items-center gap-2 text-xs">
@@ -460,18 +605,70 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
               </button>
             </div>
           )}
-          <button type="button" className="self-start rounded px-1 text-xs text-slate-300 underline hover:text-orange-200" onClick={() => set({ waypoints: [...route.waypoints].reverse().map((w, i, all) => ({ ...w, leg: all[i - 1]?.leg ?? route.waypoints.at(-1)?.leg })) })}>
-            Reverse
+          <div className="flex items-center gap-3">
+            <button type="button" className={button} disabled={!!busy} onClick={sail}>
+              Forecast ETA
+            </button>
+            <button type="button" className="rounded px-1 text-xs text-slate-300 underline hover:text-orange-200" onClick={() => set({ waypoints: [...route.waypoints].reverse().map((w, i, all) => ({ ...w, leg: all[i - 1]?.leg ?? route.waypoints.at(-1)?.leg })) })}>
+              Reverse
+            </button>
+          </div>
+          <button type="button" className={`${button} self-start`} disabled={!!busy} onClick={weatherRoute}>
+            Weather routing
           </button>
+          {route.weather && (
+            <div className="flex flex-col gap-1 text-xs">
+              <table className="tabular-nums">
+                <thead className="text-slate-400">
+                  <tr>
+                    <th className="text-left font-normal">Option</th>
+                    <th className="text-right font-normal">Hours</th>
+                    <th className="text-right font-normal">nm</th>
+                    <th className="text-right font-normal" title="Maximum significant roll">Roll</th>
+                    <th className="text-right font-normal" title="Maximum significant transverse acceleration at cargo positions, g">Trans.</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {route.weather.options.map((o) => (
+                    <tr key={o.name}>
+                      <td className="flex items-center gap-1.5">
+                        <span className="inline-block h-0.5 w-3" style={{ background: `rgb(${o.rgb})` }} aria-hidden="true" />
+                        {o.name}
+                      </td>
+                      <td className="text-right">{o.hours}</td>
+                      <td className="text-right">{Math.round(o.nm)}</td>
+                      <td className="text-right">{o.worst_roll != null ? `${o.worst_roll}°` : '–'}</td>
+                      <td className="text-right">{o.worst_transverse != null ? o.worst_transverse.toFixed(2) : '–'}</td>
+                      <td className="text-right">
+                        <button type="button" className="rounded px-1 text-orange-200 underline hover:text-orange-100" onClick={() => adopt(o)}>
+                          {o.name === 'Planned route' ? 'Motions' : 'Use'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {[...new Set(route.weather.options.flatMap((o) => o.warnings ?? []))].map((w) => (
+                <p key={w} className="text-amber-200">⚠ {w} ({route.weather.options.filter((o) => o.warnings?.includes(w)).map((o) => o.name.toLowerCase()).join(', ')})</p>
+              ))}
+              {!route.myVessel && <p className={note}>Select an own vessel above to calculate motions and the Least motion option.</p>}
+              <p className={note}>{route.weather.note}</p>
+              <button type="button" className="self-start rounded px-1 text-slate-300 underline hover:text-orange-200" onClick={() => setRoute((now) => ({ ...now, weather: undefined }))}>
+                Clear
+              </button>
+            </div>
+          )}
+          {voyage && <p className={note}>ETAs in blue include forecast wave and current effects. {voyage.note}</p>}
         </section>
       )}
 
       {findings && (
         <section aria-label="Check" className="flex flex-col gap-1 text-xs">
           <h3 className="font-medium">
-            Check:{' '}
+            Route check:{' '}
             {findings.length === 0 ? (
-              <span className="text-emerald-300">nothing found</span>
+              <span className="text-emerald-300">no findings</span>
             ) : (
               <span>
                 <span className={SEVERITY.danger}>{counts.danger ?? 0} danger</span>, <span className={SEVERITY.caution}>{counts.caution ?? 0} caution</span>, <span className={SEVERITY.info}>{counts.info ?? 0} note</span>
@@ -488,7 +685,7 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
               </li>
             ))}
           </ol>
-          <p className={note}>From NOAA's charts at chart datum, and its tides at bridges. Not for navigation: a planning aid only.</p>
+          <p className={note}>Checked against NOAA ENCs at chart datum, with predicted tides at bridges. Planning aid only. Not for navigation.</p>
         </section>
       )}
 
@@ -510,12 +707,12 @@ export function RoutesPanel({ route, setRoute, mode, setMode, planEnds, setPlanE
             </button>
           ))}
         </div>
-        <p className={note}>RTZ is what ECDIS take (IEC 61174). GPX for plotters and apps; CSV for spreadsheets.</p>
+        <p className={note}>Export: RTZ for ECDIS (IEC 61174), GPX for plotters and apps, CSV for spreadsheets.</p>
       </section>
 
       {Object.keys(kept).length > 0 && (
         <section aria-label="Saved routes" className="flex flex-col gap-1">
-          <h3 className="text-xs font-medium text-slate-400">Saved</h3>
+          <h3 className="text-xs font-medium text-slate-400">Saved routes</h3>
           <ul className="flex flex-col gap-0.5">
             {Object.values(kept).map((r) => (
               <li key={r.name} className="flex items-center justify-between gap-2">

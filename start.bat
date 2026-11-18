@@ -1,5 +1,5 @@
 @echo off
-rem ENC 3D. The first run sets everything up (it needs Python and Node), then the app fetches NOAA's charts itself.
+rem Mariner Domain Awareness. The first run sets everything up (it needs Python and Node), then the app fetches NOAA's charts itself.
 rem Close the app's window and it stops.
 cd /d "%~dp0"
 if not exist backend\.venv\Scripts\python.exe (

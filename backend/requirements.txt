@@ -3,7 +3,9 @@ geopandas==1.2.0
 httpx==0.28.1
 mapbox_earcut==2.1.0
 pyogrio==0.13.0
+pypdf==5.4.0
 python-multipart==0.0.32
+rapidocr_onnxruntime==1.4.4
 rasterio==1.5.2
 searoute==1.6.0
 zstandard==0.25.0

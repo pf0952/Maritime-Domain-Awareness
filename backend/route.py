@@ -51,7 +51,7 @@ def un_ports() -> list:
             UN_PORTS.parent.mkdir(parents=True, exist_ok=True)
             packed = UN_PORTS.with_name("unlocode-latest.zip")
             if not packed.exists():
-                request = urllib.request.Request(UN_URL, headers={"User-Agent": "ENC 3D"})
+                request = urllib.request.Request(UN_URL, headers={"User-Agent": "Mariner Domain Awareness"})
                 with urllib.request.urlopen(request, timeout=120) as res:
                     packed.write_bytes(res.read())
             found = []

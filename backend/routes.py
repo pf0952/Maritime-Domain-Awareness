@@ -175,7 +175,7 @@ def plan(start: list, end: list, vessel: dict, xtd: float = XTD) -> dict:
             lanes = searoute.searoute(start, end, units="naut")["geometry"]["coordinates"]
         except Exception as e:  # (searoute raises plain errors for points it can't place)
             lanes = None
-            notes.append(f"No shipping lane found ({e}): planned straight across")
+            notes.append(f"No shipping lane found ({e}); route laid direct")
         if lanes and len(lanes) > 2:
             out = point_along(lanes, COAST_RUN)
             back = point_along(lanes[::-1], COAST_RUN)
@@ -188,7 +188,7 @@ def plan(start: list, end: list, vessel: dict, xtd: float = XTD) -> dict:
             for a, b in zip(lane, lane[1:]):
                 mended += grid_route(a, b, vessel, xtd, notes)[1:] if leg_blocked(a, b, vessel, xtd) else [b]
             points = head + mended[1:-1] + tail
-            notes.append("Offshore, it follows the shipping lanes; inshore, the charts")
+            notes.append("Offshore sections follow shipping lanes; inshore sections are planned on the charts")
             return {"waypoints": dedupe(points), "notes": notes}
     return {"waypoints": dedupe(grid_route(start, end, vessel, xtd, notes)), "notes": notes}
 
@@ -237,12 +237,12 @@ def grid_route(start: list, end: list, vessel: dict, xtd: float, notes: list) ->
     a, b = clamp(to_cell(start), rows, cols), clamp(to_cell(end), rows, cols)
     path = astar(cost, a, b)
     if not path:
-        notes.append("No way was found: laid straight, check it")
+        notes.append("No safe path found; route laid direct. Check the route")
         return [start, end]
     if (cost[tuple(np.array(path).T)] >= BLOCKED_COST).any():
-        notes.append("Part of it has to cross water too shallow, land or a hazard, as to a berth in shallows: check it")
+        notes.append("Route crosses shallow water, land or a hazard (e.g. at a berth in shallow water). Check the route")
     if (grid[tuple(np.array(path).T)] == 0).any():
-        notes.append("Part of it is outside NOAA's charts, where nothing could be checked")
+        notes.append("Part of the route is outside NOAA charts and was not checked")
     band = cost.copy()
     band[grow(blocked, math.ceil(xtd * NM / size))] = BLOCKED_COST
     # (shallows round the ends, as a berth's, are crossed in a straight run rather than a waypoint a cell)
@@ -421,24 +421,24 @@ def check(route: dict) -> list:
             bands = [(d1, d2, depth_kind(d1, d2, depth)) for g, d1, d2 in data["water"] if g.intersects(here)]
             too = [d1 for d1, d2, kind in bands if kind == 2]
             if too:
-                issues.append(("danger", "shallow", f"Water {min(d for d in too if d is not None) if any(d is not None for d in too) else 0:.1f} m deep at chart datum, under the {depth:.1f} m wanted", here))
+                issues.append(("danger", "shallow", f"Charted depth {min(d for d in too if d is not None) if any(d is not None for d in too) else 0:.1f} m, less than {depth:.1f} m required", here))
             spots = data["soundings"]
             spots = spots[spots[:, 2] < depth] if len(spots) else spots
             if len(spots):
                 hit = shapely.contains_xy(here, spots[:, 0], spots[:, 1])
                 if hit.any():
                     worst = spots[hit][spots[hit][:, 2].argmin()]
-                    issues.append(("danger", "shallow", f"Sounding of {worst[2]:.1f} m, under the {depth:.1f} m wanted", shapely.Point(worst[:2])))
+                    issues.append(("danger", "shallow", f"Sounding {worst[2]:.1f} m, less than {depth:.1f} m required", shapely.Point(worst[:2])))
             straddle = [(d1, d2) for d1, d2, kind in bands if kind == 3]
             if straddle:
                 d1, d2 = min(straddle, key=lambda b: b[0] or 0)
-                issues.append(("caution", "depth band", f"Depth band {d1 or 0:.1f} to {d2:.1f} m: no sounding under the {depth:.1f} m wanted here, but check", here))
+                issues.append(("caution", "depth band", f"Depth area {d1 or 0:.1f}–{d2:.1f} m spans {depth:.1f} m required; no shallower sounding charted. Verify", here))
             if any(g.intersects(here) for g in data["land"]):
-                issues.append(("danger", "land", "Land within the cross-track distance", here))
+                issues.append(("danger", "land", "Land within cross-track limit", here))
             for g, sounding, layer, hname in data["hazards"]:
                 if g.intersects(here) and (sounding is None or sounding < depth):
                     what = {"WRECKS": "Wreck", "UWTROC": "Rock", "OBSTRN": "Obstruction"}[layer]
-                    over = f", {sounding:.1f} m over it" if sounding is not None else ", depth over it unknown"
+                    over = f", least depth {sounding:.1f} m" if sounding is not None else ", least depth unknown"
                     issues.append(("danger", "hazard", f"{what}{f' ({hname})' if hname else ''}{over}", g))
             for g, kind, rname in data["restricted"]:
                 if g.intersects(here):
@@ -451,7 +451,7 @@ def check(route: dict) -> list:
                 issues.append(bridge_finding(g, clear, bname, at, eta, air))
         outside = band.difference(covered)
         if outside.area > band.area * 0.02:
-            issues.append(("caution", "uncharted", "Part of this leg is outside NOAA's charts: not checked", outside))
+            issues.append(("caution", "uncharted", "Leg partly outside NOAA charts; not checked", outside))
         when += rhumb_nm(pa, pb) / speed * 3600
         order = {"danger": 0, "caution": 1, "info": 2}
         for severity, kind, text, where in sorted(issues, key=lambda x: order[x[0]]):
@@ -463,19 +463,19 @@ def check(route: dict) -> list:
 def bridge_finding(g, clear, name, at, eta, air) -> tuple:
     title = name or "Bridge"
     if clear is None:
-        return ("caution", "bridge", f"{title}: the chart gives no clearance", at)
+        return ("caution", "bridge", f"{title}: no charted clearance", at)
     level, mhw = tide_at(at.x, at.y, eta)
     if level is None or mhw is None:
-        room, said = clear, f"{clear:.1f} m above MHW (no tide for the time of passing)"
+        room, said = clear, f"clearance {clear:.1f} m above MHW (no tide prediction for time of passage)"
     else:
         room = clear + mhw - level
-        said = f"{room:.1f} m at the tide when passing ({clear:.1f} m above MHW)"
+        said = f"clearance {room:.1f} m at predicted tide ({clear:.1f} m above MHW)"
     if air is None:
-        return ("info", "bridge", f"{title}: {said}; give an air draught to check it", at)
+        return ("info", "bridge", f"{title}: {said}; enter air draught to check", at)
     air = float(air)
     if room < air:
-        return ("danger", "bridge", f"{title}: {said}, under the air draught of {air:.1f} m", at)
-    return ("info", "bridge", f"{title}: {said}, {room - air:.1f} m over the air draught", at)
+        return ("danger", "bridge", f"{title}: {said}, less than air draught {air:.1f} m", at)
+    return ("info", "bridge", f"{title}: {said}, {room - air:.1f} m above air draught", at)
 
 
 def tide_at(lng: float, lat: float, when: float) -> tuple:
@@ -507,3 +507,354 @@ def dedupe_findings(found: list) -> list:
             seen.add(key)
             out.append(f)
     return out
+
+
+# --- ports, their approaches, and a voyage through the forecast
+
+APPROACH_REACH = 25  # nm round a port to look for its pilot boarding place or fairway buoy
+APPROACH_FAR = 60  # nm, then, for a port far up a river or channel
+SAMPLE_HOURS = 1.0  # of steaming between looks at the forecast along a leg
+
+
+def find_ports(q: str, most: int = 12) -> list:
+    """Ports by name or code, those whose name starts so first."""
+    import route
+
+    by_code, by_name = route.ports()
+    q = q.strip().upper()
+    if not q:
+        return []
+    hits = [p for c, p in by_code.items() if c.upper().replace(" ", "") == q.replace(" ", "")]
+    starts = [p for n, p in by_name.items() if n.startswith(q)]
+    within = [p for n, p in by_name.items() if q in n and not n.startswith(q)]
+    seen, out = set(), []
+    for p in hits + starts + within:
+        if p["code"] not in seen:
+            seen.add(p["code"])
+            out.append({"code": p["code"], "name": p["name"], "lng": p["lng"], "lat": p["lat"]})
+        if len(out) >= most:
+            break
+    return out
+
+
+@functools.lru_cache(maxsize=64)
+def approach_marks(name: str, version) -> list:
+    """A chart's pilot boarding places and safe-water (fairway) buoys: (kind, name, lng, lat)."""
+    path = sync.cell_path(sync.catalog.by_name[name])
+    layers = set(pyogrio.list_layers(path)[:, 0])
+    marks = []
+    for layer, kind in (("PILBOP", "pilot boarding place"), ("BOYSAW", "fairway buoy")):
+        if layer in layers:
+            frame = pyogrio.read_dataframe(path, layer=layer, columns=["OBJNAM"])
+            for g, n in zip(frame.geometry, frame["OBJNAM"]):
+                if g is not None and not g.is_empty:
+                    p = g.representative_point()
+                    marks.append((kind, n if isinstance(n, str) else None, p.x, p.y))
+    return marks
+
+
+def approach(lng: float, lat: float) -> dict:
+    """Where a voyage to or from a port begins at sea: the nearest charted pilot boarding place within reach of it,
+    or else the outermost fairway buoy; looking further out for a port far up a river or channel; failing all of
+    those, the port itself."""
+    for reach in (APPROACH_REACH, APPROACH_FAR):
+        found = approach_within(lng, lat, reach)
+        if found:
+            return found
+    return {"lng": lng, "lat": lat, "kind": "port", "name": None, "nm_from_port": 0.0}
+
+
+def approach_within(lng: float, lat: float, reach: float):
+    pad = reach / 60
+    area = shapely.box(lng - pad / max(math.cos(math.radians(lat)), 0.2), lat - pad,
+                       lng + pad / max(math.cos(math.radians(lat)), 0.2), lat + pad)
+    found = []
+    # (coastal and approach charts first: that's where sea buoys and pilot stations are charted)
+    for chart in sorted(sync.catalog.over(area), key=lambda c: (c.band > 4, c.band))[:24]:
+        found += approach_marks(chart.name, sync.on_disk.get(chart.name))
+    for kind in ("pilot boarding place", "fairway buoy"):
+        near = [(rhumb_nm([lng, lat], [x, y]), name, x, y) for k, name, x, y in found if k == kind]
+        near = [n for n in near if n[0] <= reach]
+        if near:
+            # the pilots' nearest place; the sea buoy, the outermost fairway buoy, where the channel begins
+            d, name, x, y = min(near) if kind == "pilot boarding place" else max(near)
+            return {"lng": round(x, 6), "lat": round(y, 6), "kind": kind, "name": name, "nm_from_port": round(d, 1)}
+    return None
+
+
+def forecast_at(points: list, hours: list, now: float) -> list:
+    """The forecast at each place at the hour the vessel is there (None past it, or over land): waves, their
+    period, swell, wind and current."""
+    import weather
+
+    snapped = [(round(round(lat / 0.5) * 0.5, 3), round(round(lng / 0.5) * 0.5, 3)) for lng, lat in points]
+    missing = sorted({p for p, h in zip(snapped, hours) if h < FORECAST_HOURS
+                      and not (p in weather.point_cache and weather.point_cache[p][0] > time.time())})
+    for i in range(0, len(missing), weather.BATCH):
+        try:
+            weather.fetch(missing[i : i + weather.BATCH])
+        except (OSError, ValueError, KeyError):
+            break  # (what's to hand is used; the rest goes without)
+    out = []
+    for p, h in zip(snapped, hours):
+        cached = weather.point_cache.get(p)
+        if h >= FORECAST_HOURS or not cached:
+            out.append(None)
+            continue
+        _, start, values = cached
+        at = int((now + h * 3600 - start) // 3600)
+        if not 0 <= at < len(values.get("wave") or []):
+            out.append(None)
+            continue
+        pick = lambda k: (values.get(k) or [None] * (at + 1))[at] if k in values else None
+        out.append({k: pick(k) for k in ("wave", "waveFrom", "period", "swell", "swellFrom", "swellPeriod", "sea",
+                                         "seaFrom", "seaPeriod", "wind", "windFrom", "current", "currentTo")})
+    return out
+
+
+FORECAST_HOURS = 7 * 24  # hours ahead the marine forecast reaches, about
+
+
+def voyage(route_: dict, vessel: dict | None = None) -> dict:
+    """The route sailed through the forecast: each leg looked at every SAMPLE_HOURS of steaming, its speed through
+    the water cut by the waves (route.speed_lost) from the leg's ordered speed, and the current added along the
+    course. Past the forecast, the ordered speed. With each leg's times, and a timeline for the motions."""
+    import route
+
+    vessel = vessel or {}
+    length = float(vessel.get("length") or 150)
+    waypoints = route_.get("waypoints") or []
+    start = float(route_.get("departure") or time.time())
+    now = time.time()
+    when = start
+    legs, timeline = [], []
+    for i, (a, b) in enumerate(zip(waypoints, waypoints[1:])):
+        leg = b.get("leg") or {}
+        order = float(leg.get("speed") or route_.get("speed") or SPEED)
+        pa, pb = [a["lng"], a["lat"]], [b["lng"], b["lat"]]
+        great = leg.get("geometry") == "great"
+        points = great_circle(pa, pb, 64) if great else [pa, pb]
+        total = sum(rhumb_nm(p, q) for p, q in zip(points, points[1:]))
+        n = max(1, int(math.ceil(total / (order * SAMPLE_HOURS))))
+        # the leg in n pieces, each at its own place, heading and time
+        done, left, loss_sum, worst, beyond = 0.0, total, 0.0, 0.0, False
+        leg_start = when
+        piece = total / n
+        for k in range(n):
+            frac = (k + 0.5) / n
+            here = point_along(points, total * frac) if great else [pa[0] + (pb[0] - pa[0]) * frac, pa[1] + (pb[1] - pa[1]) * frac]
+            ahead = point_along(points, min(total, total * frac + 0.5)) if great else pb
+            heading = route.bearing(here, ahead)
+            f = forecast_at([here], [(when - now) / 3600], now)[0]
+            stw = order
+            sog = order
+            if f and f.get("wave") is not None and f.get("waveFrom") is not None:
+                lost = route.speed_lost(f["wave"], f["waveFrom"], heading, length)
+                stw = order * (1 - lost)
+                loss_sum += lost
+                worst = max(worst, f["wave"])
+                sog = stw
+                if f.get("current") is not None and f.get("currentTo") is not None:
+                    # (in knots, flowing toward currentTo: what of it runs along the course)
+                    sog = max(0.5, stw + f["current"] * math.cos(math.radians(f["currentTo"] - heading)))
+            else:
+                beyond = True
+            timeline.append({"leg": i, "t": when, "lng": round(here[0], 4), "lat": round(here[1], 4), "heading": round(heading, 1),
+                             "speed": round(sog, 2), "stw": round(stw, 2), "forecast": f})
+            when += piece / sog * 3600
+        legs.append({"leg": i, "nm": round(total, 2), "order": order, "depart": leg_start, "arrive": when,
+                     "speed": round(total / ((when - leg_start) / 3600), 2) if when > leg_start else order,
+                     "loss_pct": round(100 * loss_sum / n, 1), "worst_wave": round(worst, 1), "beyond_forecast": beyond})
+    out = {"departure": start, "arrival": when, "legs": legs, "timeline": timeline,
+           "note": "Speed loss in waves estimated by rule of thumb, not from sea trials. Beyond the forecast range, ordered speed is used."}
+    ship = ship_of(vessel.get("my"))
+    if ship:
+        my = vessel["my"]
+        motions_on(timeline, {**ship, "depth": my.get("depth")}, my.get("cargo") or [], float(my.get("lcf") or ship["lbp"] / 2),
+                   float(my.get("kg") or 0))
+    return out
+
+
+# --- weather routing: three ways from the start to the end through the forecast, by isochrones
+
+ISO_HOURS = 3.0  # between isochrones
+ISO_SPREAD = 80  # ° either side of the way to the end, the headings tried from each point
+ISO_STEP = 10  # ° between them
+ISO_SECTORS = 72  # bearings from the start that the front is kept one point each in
+ISO_MOST = 120  # isochrones at most (15 days)
+LAND_CLEAR = 8  # nm round each end where the coarse land is let be (a sea buoy can sit on its outline)
+
+
+def sea_of(f: dict) -> list:
+    """A forecast's sea as components (height, period, from): the wind's sea and the swell, or the sea all told."""
+    if not f:
+        return []
+    parts = []
+    if f.get("sea") and f.get("seaFrom") is not None:
+        parts.append((f["sea"], f.get("seaPeriod") or f.get("period") or 6.0, f["seaFrom"]))
+    if f.get("swell") and f.get("swellFrom") is not None:
+        parts.append((f["swell"], f.get("swellPeriod") or f.get("period") or 9.0, f["swellFrom"]))
+    if not parts and f.get("wave") and f.get("waveFrom") is not None:
+        parts.append((f["wave"], f.get("period") or 7.0, f["waveFrom"]))
+    return parts
+
+
+def under_way(order: float, heading: float, f: dict | None, length: float, ship: dict | None):
+    """Speed over the ground on a heading in this forecast, and her motions (None without a ship to judge them)."""
+    import motions
+    import route
+
+    sog, motion = order, None
+    if f and f.get("wave") is not None and f.get("waveFrom") is not None:
+        sog = order * (1 - route.speed_lost(f["wave"], f["waveFrom"], heading, length))
+        if f.get("current") is not None and f.get("currentTo") is not None:
+            sog = max(0.5, sog + f["current"] * math.cos(math.radians(f["currentTo"] - heading)))
+    if ship:
+        motion = motions.respond(ship, heading, sog, sea_of(f))
+    return sog, motion
+
+
+def step_from(p: list, heading: float, nm: float) -> list:
+    r = math.radians(heading)
+    lat = p[1] + nm * math.cos(r) / 60
+    mid = math.radians((p[1] + lat) / 2)
+    return [p[0] + nm * math.sin(r) / (60 * max(math.cos(mid), 0.05)), lat]
+
+
+def sea_room(start: list, end: list):
+    """Land to keep off, coarse (Natural Earth's): within a box round the way, less a circle round each end."""
+    pad = 12.0
+    box = shapely.box(min(start[0], end[0]) - pad, min(start[1], end[1]) - pad, max(start[0], end[0]) + pad,
+                      min(85, max(start[1], end[1]) + pad))
+    polys, tree = charts.load_polygons(sync.land_source("overview"))
+    near = polys[tree.query(box, "intersects")]
+    if not len(near):
+        return None
+    land = shapely.intersection(shapely.union_all(near), box)
+    for p in (start, end):
+        land = land.difference(shapely.Point(p).buffer(LAND_CLEAR / 60))
+    shapely.prepare(land)
+    return land
+
+
+def isochrone_route(start: list, end: list, depart: float, order: float, length: float, ship: dict | None,
+                    comfort: bool, land) -> dict | None:
+    """The quickest way through the forecast (or, with comfort, the one with the least time weighted by how hard the
+    sea works her): each ISO_HOURS, from each point of the front, the headings either side of the way to the end;
+    of what's reached, the best in each sector of bearing from the start kept. Waypoints and times."""
+    import motions
+    import route
+
+    now = time.time()
+    front = [{"p": start, "t": depart, "cost": 0.0, "parent": None, "motion": None, "sog": order}]
+    finish = None
+    seen = []
+    for _ in range(ISO_MOST):
+        reached = []
+        hours = [(n["t"] - now) / 3600 for n in front]
+        casts = forecast_at([n["p"] for n in front], hours, now)
+        for n, f in zip(front, casts):
+            to_end = route.nm(n["p"], end)
+            way = route.bearing(n["p"], end)
+            for dh in range(-ISO_SPREAD, ISO_SPREAD + 1, ISO_STEP):
+                heading = (way + dh) % 360
+                sog, motion = under_way(order, heading, f, length, ship)
+                weight = motions.comfort_cost(motion) if comfort and motion else 1.0
+                run = sog * ISO_HOURS
+                if dh == 0 and run >= to_end:  # (the end within this step, made good straight to it)
+                    hours_left = to_end / sog
+                    cost = n["cost"] + hours_left * weight
+                    if finish is None or cost < finish["cost"]:
+                        finish = {"p": end, "t": n["t"] + hours_left * 3600, "cost": cost, "parent": n, "motion": motion, "sog": sog}
+                    continue
+                p = step_from(n["p"], heading, run)
+                if land is not None and land.intersects(shapely.LineString([n["p"], p])):
+                    continue
+                reached.append({"p": p, "t": n["t"] + ISO_HOURS * 3600, "cost": n["cost"] + ISO_HOURS * weight,
+                                "parent": n, "motion": motion, "sog": sog})
+        if finish is not None and (not reached or min(route.nm(r["p"], end) for r in reached) > 0):
+            # (a point that's already arrived beats any still at sea, as all of them have spent as long)
+            break
+        if not reached:
+            return None
+        # the best in each sector of bearing from the start: nearest the end, for its time and discomfort
+        best = {}
+        for r in reached:
+            sector = int(route.bearing(start, r["p"]) // (360 / ISO_SECTORS))
+            score = route.nm(r["p"], end) / order + r["cost"]
+            if sector not in best or score < best[sector][0]:
+                best[sector] = (score, r)
+        front = [r for _, r in sorted(best.values(), key=lambda s: s[0])[:ISO_SECTORS]]
+        seen.append(len(front))
+    if finish is None:
+        return None
+    path, n = [], finish
+    while n is not None:
+        path.append(n)
+        n = n["parent"]
+    path.reverse()
+    return {"waypoints": [[round(n["p"][0], 5), round(n["p"][1], 5)] for n in path], "times": [n["t"] for n in path],
+            "arrival": finish["t"], "nm": sum(route.nm(a["p"], b["p"]) for a, b in zip(path, path[1:]))}
+
+
+def ship_of(my: dict | None) -> dict | None:
+    """What the motions need of a vessel, from the Routes panel's My vessel."""
+    if not my or not my.get("lbp"):
+        return None
+    return {"lbp": float(my["lbp"]), "beam": float(my["beam"]), "draught": float(my.get("draught") or 5.0),
+            "gm": float(my.get("gm") or 1.0), "roll_period": my.get("roll_period")}
+
+
+def motions_on(timeline: list, ship: dict, cargo: list, lcf: float, kg: float) -> None:
+    """Each sample of a passage given her motions there and the accelerations at each cargo position (in place)."""
+    import motions
+
+    draught = ship["draught"]
+    for s in timeline:
+        m = motions.respond(ship, s["heading"], s["speed"], sea_of(s.get("forecast")))
+        s["motion"] = {"roll": round(m["roll"], 1), "pitch": round(m["pitch"], 1), "heave": round(m["heave"], 2),
+                       "roll_period": round(m["roll_period"], 1), "warnings": m["warnings"]}
+        points = cargo or [{"name": "Deck amidships, side", "x": lcf, "y": ship["beam"] / 2, "z": ship.get("depth", draught + 6)}]
+        s["accelerations"] = [{"name": c["name"], **{k: round(v, 3) for k, v in
+                               motions.accelerations(m, c["x"] - lcf, c["y"], c["z"] - draught).items()}} for c in points[:12]]
+
+
+def weather_routes(route_: dict, my: dict | None) -> dict:
+    """Three ways from the route's first waypoint to its last through the forecast: the fastest, the most
+    comfortable (time weighted by roll and pitch, steering round the worst), and the route as planned; each with its
+    passage, her motions along it, and the accelerations at her cargo."""
+    import route
+
+    wps = route_.get("waypoints") or []
+    start, end = [wps[0]["lng"], wps[0]["lat"]], [wps[-1]["lng"], wps[-1]["lat"]]
+    depart = float(route_.get("departure") or time.time())
+    order = float(route_.get("speed") or SPEED)
+    ship = ship_of(my)
+    length = float((my or {}).get("lbp") or 150)
+    land = sea_room(start, end)
+    options = []
+    planned = voyage(route_, {"length": length})
+    options.append({"name": "Planned route", "waypoints": [[w["lng"], w["lat"]] for w in wps], "arrival": planned["arrival"],
+                    "nm": sum(l["nm"] for l in planned["legs"]), "timeline": planned["timeline"]})
+    for name, comfort in (("Fastest", False), ("Least motion", True)):
+        found = isochrone_route(start, end, depart, order, length, ship if (comfort or ship) else None, comfort, land)
+        if not found:
+            continue
+        r = {"waypoints": [{"lng": x, "lat": y, "leg": {"speed": order}} for x, y in found["waypoints"]], "speed": order,
+             "departure": depart}
+        sailed = voyage(r, {"length": length})
+        options.append({"name": name, "waypoints": found["waypoints"], "arrival": sailed["arrival"],
+                        "nm": round(found["nm"], 1), "timeline": sailed["timeline"]})
+    for o in options:
+        if ship:
+            motions_on(o["timeline"], {**ship, "depth": (my or {}).get("depth")}, (my or {}).get("cargo") or [],
+                       float((my or {}).get("lcf") or ship["lbp"] / 2), float((my or {}).get("kg") or 0))
+            rolls = [s["motion"]["roll"] for s in o["timeline"]]
+            o["worst_roll"] = max(rolls, default=0.0)
+            o["worst_pitch"] = max((s["motion"]["pitch"] for s in o["timeline"]), default=0.0)
+            o["worst_transverse"] = max((a["transverse"] for s in o["timeline"] for a in s["accelerations"]), default=0.0)
+            o["warnings"] = sorted({w for s in o["timeline"] for w in s["motion"]["warnings"]})
+        o["hours"] = round((o["arrival"] - depart) / 3600, 1)
+        o["worst_wave"] = max(((s.get("forecast") or {}).get("wave") or 0 for s in o["timeline"]), default=0.0)
+    return {"departure": depart, "options": options, "note": "Open-Meteo forecast, about 7 days ahead. "
+            "Motions estimated from GM and sea state, not from vessel seakeeping data. Routes avoid coarse coastline only: check the selected route against the charts. Planning aid only. Not for navigation."}

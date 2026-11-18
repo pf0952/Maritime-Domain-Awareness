@@ -9,23 +9,23 @@ const TIDE_CARD =
   'absolute bottom-0 left-1/2 w-[min(38rem,calc(100%-2rem))] -translate-x-1/2 translate-y-[calc(100%-2.25rem)] rounded-t-xl border border-b-0 border-slate-700 bg-slate-900/90 px-4 pt-2.5 pb-4 text-slate-100 shadow-xl transition-transform duration-200 hover:translate-y-0 focus-within:translate-y-0'
 
 export function syncMessage(sync) {
-  if (!sync) return 'Connecting'
+  if (!sync) return 'Connecting…'
   const { phase, done, total, charts, problem } = sync
   if (phase === 'downloading' && total > 0) return `Downloading charts: ${done.toLocaleString()} of ${total.toLocaleString()}`
   if (phase === 'compiling' && total > 0) return `Preparing charts: ${done.toLocaleString()} of ${total.toLocaleString()}`
-  if (phase === 'coast') return "Downloading the world's coast: 1 GB, the first time only"
-  if (phase === 'seabed') return "Downloading the world's seabed: 4 GB, the first time only"
-  if (phase === 'checking' || phase === 'starting') return 'Checking NOAA for updates'
+  if (phase === 'coast') return 'Downloading global coastline (1 GB, first run only)…'
+  if (phase === 'seabed') return 'Downloading global bathymetry (4 GB, first run only)…'
+  if (phase === 'checking' || phase === 'starting') return 'Checking NOAA for updates…'
   return `${charts.toLocaleString()} charts${problem ? '' : ', up to date'}`
 }
 
 export function TidePanel({ tide, hour, setHour }) {
   if (!tide) return null
   if (tide.failed) {
-    return <p className={`${TIDE_CARD} text-sm text-amber-200`}>The tide couldn't be had just now: trying again shortly</p>
+    return <p className={`${TIDE_CARD} text-sm text-amber-200`}>Tide data unavailable. Retrying shortly.</p>
   }
   if (!tide.station) {
-    return <p className={`${TIDE_CARD} text-sm text-slate-300`}>No tide station near here</p>
+    return <p className={`${TIDE_CARD} text-sm text-slate-300`}>No tide station nearby</p>
   }
   const level = tide.levels[hour + TIDE_HOURS]
   const low = Math.min(...tide.levels)
@@ -38,7 +38,7 @@ export function TidePanel({ tide, hour, setHour }) {
     hour: 'numeric',
     minute: '2-digit',
   })
-  const source = tide.observed[hour + TIDE_HOURS] ? 'measured' : tide.predicted ? 'predicted' : 'last reading'
+  const source = tide.observed[hour + TIDE_HOURS] ? 'observed' : tide.predicted ? 'predicted' : 'last observation'
   const offset = hour === 0 ? 'Now' : `${hour > 0 ? '+' : '−'}${Math.abs(hour)} h`
   return (
     <section aria-label="Tide" className={`${TIDE_CARD} flex flex-col gap-1 text-sm`}>
@@ -117,7 +117,7 @@ export function SearchBar({ go }) {
     // (a slow answer to an earlier search mustn't land on top of this one's)
     asking.current?.abort()
     const { signal } = (asking.current = new AbortController())
-    setNote('Searching')
+    setNote('Searching…')
     setPlaces([])
     const q = encodeURIComponent(query.trim())
     const [towns, ships] = await Promise.all([
@@ -137,7 +137,7 @@ export function SearchBar({ go }) {
       !(towns ?? []).some((town) => town.name.split(',')[0].trim().toUpperCase() === asked)
     // as two groups, whichever's likelier first
     const found = exact ? [...vessels, ...(towns ?? [])] : [...(towns ?? []), ...vessels]
-    setNote(towns || ships ? (found.length ? '' : 'Nothing found') : "Search isn't available just now")
+    setNote(towns || ships ? (found.length ? '' : 'No results') : 'Search unavailable. Try again later.')
     setPlaces(found)
     if (found.length) go(found[0])
   }
@@ -151,7 +151,7 @@ export function SearchBar({ go }) {
       <input
         type="search"
         aria-label="Search for a place or vessel"
-        placeholder="Search for a place or vessel, then press Enter"
+        placeholder="Place, vessel name or MMSI, then Enter"
         value={query}
         onChange={(e) => {
           setQuery(e.target.value)
@@ -206,7 +206,7 @@ const hoursApart = (a, b) => {
 function RoutePrediction({ route }) {
   if (!route) return null
   if (!route.port) {
-    return <p className="text-xs text-slate-400">Destination “{route.said}” isn't in the port list, so there's no route to predict.</p>
+    return <p className="text-xs text-slate-400">Destination “{route.said}” not found in the port list. No route prediction.</p>
   }
   const delay = Math.round((route.arrive - route.calmArrive) / 3600)
   const stale = Math.round((Date.now() / 1000 - route.from) / 3600)
@@ -217,12 +217,12 @@ function RoutePrediction({ route }) {
       </p>
       <p className="text-slate-300">
         {route.miles.toLocaleString()} nm at {route.knots} kn
-        {delay > 0 ? `, ${delay} h lost to seas up to ${route.worstWaves} m` : route.worstWaves ? `, seas up to ${route.worstWaves} m` : ''}.
-        {route.aisEta && ` That's ${hoursApart(route.arrive, route.aisEta)} its own ETA.`}
+        {delay > 0 ? `, ${delay} h weather delay (seas up to ${route.worstWaves} m)` : route.worstWaves ? `, seas up to ${route.worstWaves} m` : ''}.
+        {route.aisEta && ` Predicted arrival is ${hoursApart(route.arrive, route.aisEta)} the AIS ETA.`}
       </p>
       <p className="text-slate-400">
-        {stale >= 2 && `From its last report, ${stale} h ago. `}By the usual shipping lanes and the forecast weather: a guess,
-        not its plan.
+        {stale >= 2 && `Based on the last AIS position, ${stale} h ago. `}Estimate via common shipping lanes and forecast weather;
+        not the vessel's passage plan.
       </p>
     </div>
   )
@@ -271,14 +271,14 @@ export function LoadingScreen({ sync }) {
   const rate = (done - stage.current.done) / (Date.now() - stage.current.at)
   const minutes = rate > 0 ? Math.ceil((total - done) / rate / 60000) : null
   const heading =
-    { downloading: 'Downloading charts from NOAA', compiling: 'Preparing charts', warnings: 'Placing nav warnings' }[phase] ??
+    { downloading: 'Downloading charts from NOAA', compiling: 'Preparing charts', warnings: 'Placing navigational warnings' }[phase] ??
     'Checking charts'
   const counting = (phase === 'downloading' || phase === 'compiling') && total > 0
   const percent = counting ? Math.floor((100 * done) / total) : 0
   return (
     <main className="fixed inset-0 grid place-items-center bg-slate-950 p-4 text-slate-100">
       <div className="flex w-full max-w-md flex-col gap-3">
-        <h1 className="text-2xl font-semibold">ENC 3D</h1>
+        <h1 className="text-2xl font-semibold">Mariner Domain Awareness</h1>
         <p className="text-slate-300">{heading}</p>
         <div
           role="progressbar"
@@ -290,10 +290,10 @@ export function LoadingScreen({ sync }) {
         </div>
         <p className="flex justify-between gap-4 text-sm text-slate-400 tabular-nums">
           <span>{counting && `${done.toLocaleString()} of ${total.toLocaleString()}`}</span>
-          <span>{counting && minutes !== null && `About ${minutes} min left`}</span>
+          <span>{counting && minutes !== null && `About ${minutes} min remaining`}</span>
         </p>
         {problem && <p className="text-sm text-amber-300">{problem}</p>}
-        <p className="mt-4 text-sm text-slate-400">Every chart is prepared now, so that the map is quick once you're in. It only takes this long the first time.</p>
+        <p className="mt-4 text-sm text-slate-400">Charts are prepared on first run so that the map loads quickly afterwards. Later starts are faster.</p>
       </div>
     </main>
   )
@@ -310,11 +310,11 @@ export function BridgeCard({ bridge, tide, hour, close }) {
   const opens = bridge.open != null
   const under = now(bridge.clearance)
   const rows = [
-    [`Charted clearance${opens ? ', closed' : ''}`, bridge.charted != null ? `${m(bridge.charted)} above MHW` : bridge.clearance != null ? `${m(bridge.clearance)}, from the span it joins` : 'not charted'],
+    [`Charted clearance${opens ? ', closed' : ''}`, bridge.charted != null ? `${m(bridge.charted)} above MHW` : bridge.clearance != null ? `${m(bridge.clearance)}, from adjoining span` : 'Not charted'],
     opens && ['Charted clearance, open', `${m(bridge.open)} above MHW`],
     opens && now(bridge.open) != null && [`Open, ${when}`, m(now(bridge.open))],
     bridge.wide != null && ['Horizontal clearance', m(bridge.wide)],
-    level != null && [`Water ${when}`, `${m(level)} above ${tide.datum}`],
+    level != null && [`Water level ${when}`, `${m(level)} above ${tide.datum}`],
     mhw != null && tide.datum === 'MLLW' && ['MHW', `${m(mhw)} above MLLW, ${tide.mhw_from}`],
     tide?.station && ['Tide station', `${tide.station.name}, ${tide.station.km} km`],
   ].filter(Boolean)
@@ -337,7 +337,7 @@ export function BridgeCard({ bridge, tide, hour, close }) {
           {m(under)} <span className="font-normal text-slate-400">vertical clearance {when}{opens ? ', closed' : ''}</span>
         </p>
       ) : (
-        <p className="text-slate-400">{bridge.clearance == null ? 'The chart gives no clearance here' : 'No tide station near: charted clearance only'}</p>
+        <p className="text-slate-400">{bridge.clearance == null ? 'No charted clearance' : 'No tide station nearby. Charted clearance only.'}</p>
       )}
       <dl className="flex flex-col gap-0.5 text-xs">
         {rows.map(([key, value]) => (
@@ -347,7 +347,7 @@ export function BridgeCard({ bridge, tide, hour, close }) {
           </div>
         ))}
       </dl>
-      <p className="text-xs text-slate-400">From the chart and NOAA tides. Not for navigation.</p>
+      <p className="text-xs text-slate-400">Source: ENC and NOAA tides. Planning aid only. Not for navigation.</p>
     </section>
   )
 }

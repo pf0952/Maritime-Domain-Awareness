@@ -1,6 +1,6 @@
-"""Starts ENC 3D and opens it in a window of its own, like an app: no address bar, no tabs, no port to know.
+"""Starts Mariner Domain Awareness and opens it in a window of its own, like an app: no address bar, no tabs, no port to know.
 
-start.bat runs this, with no console of its own. If ENC 3D is already running, it just opens another window onto it.
+start.bat runs this, with no console of its own. If Mariner Domain Awareness is already running, it just opens another window onto it.
 If not, it starts the server on the first free port from 8000 (another app may have 8000) and opens the window once
 the server answers. The window is Edge's app mode, at enc3d.localhost, which Edge and Chrome take to be this computer
 without any setup; with no Edge, it opens in the default browser instead.
@@ -34,7 +34,7 @@ QUIET = 45  # s with no word from any window: it was closed without a goodbye, o
 
 
 def ours(port: int) -> bool:
-    """Is ENC 3D's server on this port? Its status answer says so; another app's won't."""
+    """Is Mariner Domain Awareness's server on this port? Its status answer says so; another app's won't."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=2) as res:
             return "charts" in json.load(res)
@@ -55,7 +55,7 @@ def open_window(port: int) -> None:
         subprocess.Popen([str(edge), f"--app={url}"])
     else:
         webbrowser.open(url)
-    print(f"ENC 3D is open at {url}", flush=True)
+    print(f"Mariner Domain Awareness is open at {url}", flush=True)
 
 
 def watch(windows: dict, server) -> None:
@@ -86,7 +86,7 @@ def main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     running = next((p for p in ([asked] if asked else PORTS) if ours(p)), None)
     if running:
-        print(f"ENC 3D is already running, on port {running}", flush=True)
+        print(f"Mariner Domain Awareness is already running, on port {running}", flush=True)
         if window:
             open_window(running)
         return
@@ -101,7 +101,7 @@ def main() -> None:
             time.sleep(0.5)
 
     threading.Thread(target=when_ready, daemon=True).start()
-    print(f"Starting ENC 3D on port {port}, {time.strftime('%Y-%m-%d %H:%M')}", flush=True)
+    print(f"Starting Mariner Domain Awareness on port {port}, {time.strftime('%Y-%m-%d %H:%M')}", flush=True)
     import uvicorn
 
     sys.path.insert(0, str(Path(__file__).parent))

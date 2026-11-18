@@ -563,7 +563,7 @@ export function currentArrows(stations, hour, zoom, level) {
     const strength = Math.abs(knots)
     const color = [...currentColour(strength), CURRENT_ALPHA]
     const slack = strength < SLACK || towards === null || towards === undefined
-    labels.push({ position: [s.lng, s.lat], text: slack ? 'slack' : `${strength.toFixed(1)} kn`, name: s.name })
+    labels.push({ position: [s.lng, s.lat], text: slack ? 'Slack' : `${strength.toFixed(1)} kn`, name: s.name })
     if (slack) {
       dots.push({ position: [s.lng, s.lat, level + 0.3], color })
       continue

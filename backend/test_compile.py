@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 import charts
 import main
 
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://127.0.0.1")
 cells = Path(__file__).parent.parent / "enc/ENC_ROOT"
 alaska, harbour = cells / "US3AK1EX/US3AK1EX.000", cells / "US5BOSCD/US5BOSCD.000"
 cell = alaska.read_bytes()

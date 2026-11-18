@@ -31,7 +31,7 @@ stations_loaded = []
 def fetch_json(url: str) -> dict:
     """A URL's JSON. Any way the fetch can fail comes out as OSError (or ValueError, for an answer that isn't JSON):
     an answer cut off part way is http.client's own kind of error otherwise, which callers wouldn't expect."""
-    request = urllib.request.Request(url, headers={"User-Agent": "ENC 3D"})
+    request = urllib.request.Request(url, headers={"User-Agent": "Mariner Domain Awareness"})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as res:
             return json.load(res)
@@ -124,7 +124,7 @@ def series(station: dict) -> dict:
     if station["live"]:
         measured_at, measured = readings("water_level", station, begin, now)
     if not len(predicted) and not len(measured):
-        raise OSError(f"no water levels from {station['name']}")
+        raise OSError(f"no water level data from {station['name']}")
     if len(predicted):
         levels = np.interp(hours, predicted_at, predicted)
     else:

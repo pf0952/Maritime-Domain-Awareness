@@ -1,5 +1,5 @@
-# ENC 3D installer: sets everything up, downloads and prepares all the charts and the world's data, and puts a shortcut
-# on the desktop. Run "Install ENC 3D.bat". It can be stopped and run again: what's done already is skipped.
+# Mariner Domain Awareness installer: sets everything up, downloads and prepares all the charts and the world's data, and puts a shortcut
+# on the desktop. Run "Install Mariner Domain Awareness.bat". It can be stopped and run again: what's done already is skipped.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -45,11 +45,11 @@ if (Ask "Download and prepare everything now?" $true) {
 
 # a shortcut on the desktop to start it, in a minimised window: closing that stops it
 $shell = New-Object -ComObject WScript.Shell
-$link = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath("Desktop")) "ENC 3D.lnk"))
+$link = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath("Desktop")) "Mariner Domain Awareness.lnk"))
 $link.TargetPath = Join-Path $PSScriptRoot "start.bat"
 $link.WorkingDirectory = $PSScriptRoot
 $link.WindowStyle = 7
-$link.Description = "ENC 3D chart viewer"
+$link.Description = "Mariner Domain Awareness"
 $link.Save()
 Write-Host ""
-Write-Host "Done. Start it from the ENC 3D shortcut on the desktop."
+Write-Host "Done. Start it from the Mariner Domain Awareness shortcut on the desktop."

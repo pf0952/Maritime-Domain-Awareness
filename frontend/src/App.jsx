@@ -14,7 +14,9 @@ import { unpack } from './meshes'
 import { INLAND_WATER_ID, SKYLINE_ID, buildLayers, ROUTE_RGB, FINDING_RGB, miles, trueBearing } from './layers'
 import { ICONS, Section, SideMenu, Toggle } from './menu'
 import { RoutesPanel, legsOf, newRoute, pathsOf } from './routes'
+import { MotionsBar } from './motions'
 import { FleetView } from './fleet'
+import { VesselTab } from './vessel'
 import { BridgeCard, LoadingScreen, SearchBar, TIDE_HOURS, TidePanel, VesselCard, syncMessage } from './panels'
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
@@ -59,11 +61,11 @@ function trim(cache, most) {
 const OVERVIEW_ASPECT = 13 / 8 // the general map's shape
 const OVERVIEW_NARROWEST = 40 // degrees across: it stays a general map, however far in you go
 const CUBE_FACES = [
-  ['top', 'Top', 'Look straight down', { pitch: 0 }],
-  ['n', 'N', 'Turn north up', { bearing: 0 }],
-  ['e', 'E', 'Turn east up', { bearing: 90 }],
-  ['s', 'S', 'Turn south up', { bearing: 180 }],
-  ['w', 'W', 'Turn west up', { bearing: -90 }],
+  ['top', 'Top', 'Top view', { pitch: 0 }],
+  ['n', 'N', 'North up', { bearing: 0 }],
+  ['e', 'E', 'East up', { bearing: 90 }],
+  ['s', 'S', 'South up', { bearing: 180 }],
+  ['w', 'W', 'West up', { bearing: -90 }],
 ]
 const NO_ENC_ZOOM = 5 // from here in, a view with no ENC at all says so
 const SEARCH_ZOOM = 14 // a place found is shown no closer than this
@@ -280,6 +282,7 @@ export default function App() {
   const [routeMode, setRouteMode] = useState(null) // 'edit': clicks lay waypoints; 'plan': clicks set its two ends
   const [planEnds, setPlanEnds] = useState([])
   const [findings, setFindings] = useState(null) // the last check's
+  const [passageAt, setPassageAt] = useState(null) // where the motions side bar has My vessel along her passage
   const [pickedWaypoint, setPickedWaypoint] = useState(null)
   const routeNow = useRef({})
   routeNow.current = { route, mode: routeMode }
@@ -1179,11 +1182,16 @@ export default function App() {
     const waypoints = route.waypoints.map((w, i) => ({ ...w, i }))
     const names = route.waypoints.map((w, i) => ({ position: [w.lng, w.lat], text: w.name || `WP${i + 1}`, offset: [0, -14], size: 11 }))
     const legLabels = legsOf(route).map((leg) => ({ position: [(leg.from.lng + leg.to.lng) / 2, (leg.from.lat + leg.to.lat) / 2], text: `${trueBearing(leg.bearing)} ${leg.nm.toFixed(1)} nm`, offset: [0, 12], size: 10 }))
-    return { paths: pathsOf(route), waypoints, names, legLabels }
+    const options = (route.weather?.options ?? []).filter((o) => o.name !== 'Planned route')
+    return { paths: pathsOf(route), waypoints, names, legLabels, options }
   }, [route])
   const findingData = useMemo(
-    () => [...(findings ?? []).map((f) => ({ position: f.at, color: FINDING_RGB[f.severity] })), ...planEnds.map((p) => ({ position: p, color: ROUTE_RGB }))],
-    [findings, planEnds],
+    () => [
+      ...(findings ?? []).map((f) => ({ position: f.at, color: FINDING_RGB[f.severity] })),
+      ...planEnds.map((p) => ({ position: p, color: ROUTE_RGB })),
+      ...(passageAt ? [{ position: [passageAt.lng, passageAt.lat], color: [103, 232, 249] }] : []),
+    ],
+    [findings, planEnds, passageAt],
   )
 
   useEffect(() => {
@@ -1223,7 +1231,7 @@ export default function App() {
         const body = new FormData()
         body.append('file', file)
         const res = await fetch('/api/uploads', { method: 'POST', body })
-        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail ?? `${file.name} failed to compile`)
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail ?? `${file.name} could not be compiled.`)
         const chart = await res.json()
         setCharts((list) => [...list.filter((c) => c.name !== chart.name), chart].sort((a, b) => b.scale - a.scale))
         const [w, s, e, n] = chart.bounds
@@ -1239,7 +1247,7 @@ export default function App() {
   async function removeUpload(name) {
     setError('')
     const res = await fetch(`/api/uploads/${encodeURIComponent(name)}`, { method: 'DELETE' }).catch(() => null)
-    if (!res?.ok) return setError(`${name} couldn't be removed`)
+    if (!res?.ok) return setError(`${name} could not be removed.`)
     setCharts((list) => list.filter((c) => c.name !== name))
     refresh.current()
   }
@@ -1267,7 +1275,7 @@ export default function App() {
             {sync?.problem && <p className="text-amber-300">{sync.problem}</p>}
             <p className="flex items-center gap-2 text-slate-400">
               {loading && <span className="size-3 shrink-0 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />}
-              {loading ? 'Loading charts in view' : `${enc.length} ${enc.length === 1 ? 'ENC' : 'ENCs'} in view`}
+              {loading ? 'Loading charts…' : `${enc.length} ${enc.length === 1 ? 'ENC' : 'ENCs'} in view`}
             </p>
           </div>
 
@@ -1276,7 +1284,7 @@ export default function App() {
             <Toggle checked={show.lndare} onChange={shows('lndare')}>Land</Toggle>
             <Toggle checked={show.buildings} onChange={shows('buildings')}>Buildings</Toggle>
             <Toggle checked={show.objects} onChange={shows('objects')}>Buoys, lights and landmarks</Toggle>
-            {show.objects && zoom < OBJECTS_ZOOM && <p className={note}>Zoom in further to see these</p>}
+            {show.objects && zoom < OBJECTS_ZOOM && <p className={note}>Zoom in to display.</p>}
           </Section>
 
           <Section title="Depth contours" className="gap-2">
@@ -1288,7 +1296,7 @@ export default function App() {
                 ['deep', 'Deep'],
               ].map(([key, label]) => (
                 <label key={key} className="flex min-w-0 flex-col gap-1 text-xs text-slate-300">
-                  {label} (m)
+                  {label}, m
                   <input
                     type="number"
                     min="0"
@@ -1304,13 +1312,13 @@ export default function App() {
             <Toggle checked={show.ecdis} disabled={!show.contours} onChange={shows('ecdis')}>ECDIS depth colours</Toggle>
           </Section>
 
-          <Section title="Your charts" className="gap-2">
+          <Section title="Imported charts" className="gap-2">
             <label
               className={`relative block rounded-lg border border-dashed border-slate-500 p-4 text-center focus-within:ring-2 focus-within:ring-cyan-400 ${
                 compiling ? 'opacity-60' : 'hover:border-cyan-400'
               }`}
             >
-              <span>Drop .000 cells here, or click to choose</span>
+              <span>Drop ENC cells (.000) here or click to select</span>
               <input
                 type="file"
                 accept=".000"
@@ -1327,7 +1335,7 @@ export default function App() {
               {compiling && (
                 <p className="flex items-center gap-2 break-all text-cyan-300">
                   <span className="size-4 shrink-0 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent" />
-                  Compiling {compiling}
+                  Compiling {compiling}…
                 </p>
               )}
               {error && <p className="text-red-400">{error}</p>}
@@ -1367,7 +1375,7 @@ export default function App() {
           {show.vessels && (
             <Section title="Filters">
               <p role="status" className="text-slate-300">
-                {vesselsFailed ? 'No AIS data just now' : `${filteredVessels.length} of ${vessels.length} in view`}
+                {vesselsFailed ? 'AIS data unavailable' : `${filteredVessels.length} of ${vessels.length} shown`}
               </p>
               {Object.entries(VESSEL_CATEGORIES).map(([name, rgb]) => (
                 <Toggle key={name} checked={vesselCategories[name]} onChange={(on) => setVesselCategories({ ...vesselCategories, [name]: on })}>
@@ -1376,22 +1384,22 @@ export default function App() {
                 </Toggle>
               ))}
               {heatmap ? (
-                <p className={`mt-2 ${note}`}>Zoomed out this far, they show as a heatmap of traffic: closer in, the vessels themselves.</p>
+                <p className={`mt-2 ${note}`}>Traffic density shown at this zoom. Zoom in to display vessels.</p>
               ) : (
-                smallestVessel > 0 && <p className={`mt-2 ${note}`}>{smallestVessel} m and longer at this zoom: closer in, smaller ones show.</p>
+                smallestVessel > 0 && <p className={`mt-2 ${note}`}>Vessels {smallestVessel} m and over shown. Zoom in for smaller vessels.</p>
               )}
             </Section>
           )}
           <p className={note}>
-            From{' '}
+            Source:{' '}
             <a href="https://openwaters.io/ais/" target="_blank" rel="noreferrer" className={link}>
               Open Waters AIS
             </a>{' '}
-            and its sources, among them{' '}
+            and contributing networks, including{' '}
             <a href="https://www.aishub.net" target="_blank" rel="noreferrer" className={link}>
               AISHub
             </a>
-            . It doesn't reach every vessel, and little of the open ocean.
+            . Coverage is incomplete, with little open-ocean data.
           </p>
         </>
       ),
@@ -1399,18 +1407,18 @@ export default function App() {
     {
       id: 'warnings',
       label: 'Warnings',
-      title: 'Nav warnings',
+      title: 'Navigation warnings',
       icon: ICONS.warnings,
       off: !show.warnings,
       body: (
         <>
-          <Toggle checked={show.warnings} onChange={shows('warnings')}>Show nav warnings</Toggle>
+          <Toggle checked={show.warnings} onChange={shows('warnings')}>Show navigation warnings</Toggle>
           {show.warnings && (
             <Section title="Filters">
               <p role="status" className="text-slate-300">
                 {!warnings || warnings.loading
-                  ? 'Collecting warnings: the first time takes a minute or two'
-                  : `${filteredWarnings.length} of ${warnings.warnings.length} showing`}
+                  ? 'Loading warnings… First load takes 1–2 minutes.'
+                  : `${filteredWarnings.length} of ${warnings.warnings.length} shown`}
               </p>
               {Object.entries(WARNING_CATEGORIES).map(([name, rgb]) => (
                 <Toggle key={name} checked={warningCategories[name]} onChange={(on) => setWarningCategories({ ...warningCategories, [name]: on })}>
@@ -1419,13 +1427,13 @@ export default function App() {
                 </Toggle>
               ))}
               <label className={`mt-2 flex flex-col gap-1 ${note}`}>
-                From
+                Area
                 <select
                   value={warningSource}
                   onChange={(e) => setWarningSource(e.target.value)}
                   className="rounded border border-slate-600 bg-slate-950 px-1.5 py-1 text-sm text-slate-100"
                 >
-                  <option value="">Everywhere</option>
+                  <option value="">All areas</option>
                   {warningSources.map((name) => (
                     <option key={name} value={name}>
                       {name}
@@ -1449,18 +1457,18 @@ export default function App() {
               </label>
               {warnings?.cut?.length > 0 && (
                 <p className="mt-2 text-xs text-amber-300">
-                  Some warnings are missing: {cutFeeds(warnings.cut)} reached SeaLagom's limit of 100, so their oldest are left out.
+                  Some warnings not shown: {cutFeeds(warnings.cut)} exceed the SeaLagom limit of 100; the oldest are omitted.
                 </p>
               )}
-              {warnings?.unplaced > 0 && <p className={`mt-2 ${note}`}>{warnings.unplaced} more give no position, so aren't on the map.</p>}
+              {warnings?.unplaced > 0 && <p className={`mt-2 ${note}`}>{warnings.unplaced} further warnings give no position and are not shown.</p>}
             </Section>
           )}
           <p className={note}>
-            From{' '}
+            Source:{' '}
             <a href="https://www.sealagom.com/" target="_blank" rel="noreferrer" className={link}>
               SeaLagom
             </a>{' '}
-            and the UK Hydrographic Office,{warnings?.checked ? ` checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}` : ' hourly'}
+            and UK Hydrographic Office.{warnings?.checked ? ` Checked ${new Date(warnings.checked * 1000).toLocaleTimeString()}.` : ' Updated hourly.'}
           </p>
         </>
       ),
@@ -1472,16 +1480,16 @@ export default function App() {
       icon: ICONS.conditions,
       body: (
         <>
-          <Section title="Shown">
+          <Section title="Display">
             <Toggle checked={show.tide} onChange={shows('tide')}>Tide bar</Toggle>
-            <Toggle checked={show.daylight} onChange={shows('daylight')}>Day and night</Toggle>
+            <Toggle checked={show.daylight} onChange={shows('daylight')}>Daylight shading</Toggle>
           </Section>
           <Section title="Tidal currents">
             <Toggle checked={show.currents} onChange={shows('currents')}>Current arrows</Toggle>
             <p className={note}>
               {zoom < CURRENTS_ZOOM
-                ? 'Zoom in further to see them.'
-                : 'Predicted at NOAA stations, US waters only. Warmer and longer the stronger they run; a ring is slack.'}
+                ? 'Zoom in to display.'
+                : 'NOAA station predictions, US waters only. Longer, warmer arrows indicate stronger current; a ring indicates slack water.'}
             </p>
           </Section>
           <Section title="Weather">
@@ -1491,16 +1499,16 @@ export default function App() {
                 <span>{label}</span>
                 {show[key] && (
                   <span className="ml-auto text-xs text-slate-300 tabular-nums">
-                    {weatherFailed ? 'none just now' : !weatherHere ? '…' : (weatherHere[key] ?? 'none here')}
+                    {weatherFailed ? 'unavailable' : !weatherHere ? '…' : (weatherHere[key] ?? 'no data')}
                   </span>
                 )}
               </Toggle>
             ))}
-            {wantWeather && <p className={note}>Values at the middle of the view.</p>}
+            {wantWeather && <p className={note}>Values at view centre.</p>}
             <p className={note}>
-              Forecast and recent hours from{' '}
-              <a href="https://open-meteo.com/" target="_blank" rel="noreferrer" className={link}>Open-Meteo</a>, CC BY 4.0,
-              moving with the tide bar's clock.
+              Source:{' '}
+              <a href="https://open-meteo.com/" target="_blank" rel="noreferrer" className={link}>Open-Meteo</a> (CC BY 4.0),
+              forecast and recent hours. Time follows the tide bar.
             </p>
           </Section>
         </>
@@ -1542,11 +1550,10 @@ export default function App() {
             onClick={() => (measuring ? stopMeasuring() : setMeasuring(true))}
             className={`rounded-lg px-3 py-1.5 font-medium ${measuring ? 'bg-yellow-300 text-slate-900' : 'bg-slate-800 text-yellow-200 hover:bg-slate-700'}`}
           >
-            {measuring ? 'Stop measuring' : measured.length ? 'Measure on from here' : 'Measure'}
+            {measuring ? 'Stop measuring' : measured.length ? 'Continue measuring' : 'Measure'}
           </button>
           <p className={note}>
-            Click points on the map. Each leg is along the rhumb line, the straight line on the chart, with its true
-            bearing. Esc stops.
+            Click the map to add points. Legs are rhumb lines with true bearings. Press Esc to stop.
           </p>
           {legs.some((leg) => !leg.live) && (
             <ol className="flex flex-col gap-0.5 text-xs tabular-nums">
@@ -1579,18 +1586,19 @@ export default function App() {
     {
       id: 'about',
       label: 'About',
-      title: 'ENC 3D',
+      title: 'Mariner Domain Awareness',
       icon: ICONS.about,
       apart: true,
       body: (
         <>
-          <p className="font-medium text-amber-300">Not for navigation.</p>
+          <p className="font-medium text-amber-300">Planning aid only. Not for navigation.</p>
           <p className="text-slate-300">
-            NOAA's electronic navigational charts in 3D, kept up to date, with live tides, vessels and nav warnings.
+            NOAA electronic navigational charts in 3D, updated automatically, with live tides, AIS vessels and navigation
+            warnings.
           </p>
           <p className={note}>
-            Beyond the charts: seabed, GEBCO_2026 Grid; coast and buildings, © OpenStreetMap contributors. Basemap ©
-            CARTO. Tides and currents, NOAA CO-OPS. Vessels, warnings and weather are credited in their own menus.
+            Outside ENC coverage: seabed, GEBCO_2026 Grid; coastline and buildings, © OpenStreetMap contributors. Basemap
+            © CARTO. Tides and currents: NOAA CO-OPS. AIS, warning and weather sources are credited in their menus.
           </p>
         </>
       ),
@@ -1605,7 +1613,7 @@ export default function App() {
       {ready && <WeatherCanvas map={map.current} weather={weather} land={land} hour={hourIndex} wind={show.wind && tab === 'map'} waves={show.waves && tab === 'map'} swell={show.swell && tab === 'map'} />}
       {/* the two views, along the top: the map, and the fleets' histories over it */}
       <div role="tablist" aria-label="Views" className="absolute top-3 right-4 z-30 flex rounded-lg border border-slate-700 bg-slate-900/95 p-0.5 text-sm shadow-xl">
-        {['map', 'fleet'].map((id) => (
+        {['map', 'fleet', 'vessel'].map((id) => (
           <button
             key={id}
             type="button"
@@ -1614,15 +1622,17 @@ export default function App() {
             onClick={() => setTab(id)}
             className={`rounded-md px-3 py-1 ${tab === id ? 'bg-cyan-400/15 text-cyan-300' : 'text-slate-300 hover:text-cyan-300'}`}
           >
-            {id === 'map' ? 'Map' : 'Fleet'}
+            {{ map: 'Map', fleet: 'Fleet', vessel: 'Vessel' }[id]}
           </button>
         ))}
       </div>
       {tab === 'fleet' && <FleetView showTrack={showFleetTrack} />}
+      {tab === 'vessel' && <VesselTab />}
+      {tab === 'map' && route.passage?.for === route.waypoints && <MotionsBar passage={route.passage} onAt={setPassageAt} />}
       <SearchBar go={goTo} />
       {measuring && (
         <p role="status" className="absolute top-16 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-yellow-300/40 bg-slate-900/95 px-3 py-1.5 text-sm text-yellow-100 shadow-xl">
-          Measuring: click to add points{legs.length > 0 && `, ${miles(measuredTotal + (legs.at(-1).live ? legs.at(-1).nm : 0))} so far`}
+          Measuring: click to add points{legs.length > 0 && `. Total ${miles(measuredTotal + (legs.at(-1).live ? legs.at(-1).nm : 0))}`}
           <button type="button" onClick={stopMeasuring} className="rounded bg-yellow-300 px-2 py-0.5 text-xs font-medium text-slate-900">
             Done
           </button>
@@ -1635,7 +1645,7 @@ export default function App() {
           !charted && zoom >= NO_ENC_ZOOM ? 'translate-y-14' : '-translate-y-full'
         }`}
       >
-        No ENCs Loaded
+        No ENC coverage
       </p>
       {picked && (
         <section
@@ -1646,7 +1656,7 @@ export default function App() {
             <h2 className="font-semibold">{picked.id}</h2>
             <button
               type="button"
-              aria-label="Close this warning"
+              aria-label="Close warning"
               onClick={() => setPickedWarnings([])}
               className="grid size-7 shrink-0 place-items-center rounded-md text-lg leading-none text-slate-300 hover:bg-slate-800 hover:text-cyan-300"
             >
@@ -1664,22 +1674,22 @@ export default function App() {
             {picked.ends && `, ends ${new Date(picked.ends * 1000).toLocaleDateString()}`}
           </p>
           {picked.placedBy && (
-            <p className="text-xs text-amber-300">It gives no position: shown roughly, at {picked.placedBy}, a place it names.</p>
+            <p className="text-xs text-amber-300">No position given. Shown approximately at {picked.placedBy}, as named in the text.</p>
           )}
           {picks.length > 1 && (
             <div className="flex items-center justify-between gap-2 text-slate-300">
               <button
                 type="button"
-                aria-label="Previous warning here"
+                aria-label="Previous warning"
                 onClick={() => setPickedTurn((picks.indexOf(picked) + picks.length - 1) % picks.length)}
                 className="rounded border border-slate-600 px-2 hover:text-cyan-300"
               >
                 ‹
               </button>
-              {picks.indexOf(picked) + 1} of {picks.length} here
+              {picks.indexOf(picked) + 1} of {picks.length} at this position
               <button
                 type="button"
-                aria-label="Next warning here"
+                aria-label="Next warning"
                 onClick={() => setPickedTurn((picks.indexOf(picked) + 1) % picks.length)}
                 className="rounded border border-slate-600 px-2 hover:text-cyan-300"
               >
@@ -1689,7 +1699,7 @@ export default function App() {
           )}
           <p className="break-words whitespace-pre-wrap text-slate-200">{picked.text}</p>
           <a href={picked.url} target="_blank" rel="noreferrer" className="text-cyan-300 underline">
-            See it on {picked.url.includes('sealagom') ? 'SeaLagom' : 'the UKHO site'}
+            View on {picked.url.includes('sealagom') ? 'SeaLagom' : 'UKHO website'}
           </a>
         </section>
       )}
@@ -1717,7 +1727,7 @@ export default function App() {
         <svg
           ref={overview}
           role="img"
-          aria-label="General map: click to go there"
+          aria-label="Overview map. Click to move the view."
           onClick={overviewClicked}
           preserveAspectRatio="xMidYMid slice"
           className="h-32 w-52 cursor-pointer rounded-lg border border-slate-700 bg-[#081e42]"
@@ -1735,7 +1745,7 @@ export default function App() {
         }`}
       >
         <span className="size-3 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" aria-hidden="true" />
-        {grey ? 'Loading charts' : ''}
+        {grey ? 'Loading…' : ''}
       </p>
     </div>
   )

@@ -297,7 +297,7 @@ def ends(text: str, issued: float) -> float | None:
 
 
 def get(url: str) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "ENC 3D nav warning viewer"})
+    request = urllib.request.Request(url, headers={"User-Agent": "Mariner Domain Awareness"})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as res:
         return res.read()
 

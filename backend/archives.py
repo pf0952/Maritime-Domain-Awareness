@@ -67,7 +67,7 @@ def gfw(path: str, params: list) -> dict:
     if not token:
         raise PermissionError("No Global Fishing Watch token set")
     request = urllib.request.Request(GFW + path + "?" + urllib.parse.urlencode(params), headers={
-        "Authorization": f"Bearer {token}", "User-Agent": "ENC 3D"})
+        "Authorization": f"Bearer {token}", "User-Agent": "Mariner Domain Awareness"})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as res:
         return json.load(res)
 
@@ -129,11 +129,11 @@ def run_gfw() -> None:
         progress["gfw"]["error"] = str(e)
     except urllib.error.HTTPError as e:
         detail = e.read()[:300].decode("utf-8", "replace")
-        progress["gfw"]["error"] = f"Global Fishing Watch said {e.code}: {detail}"
+        progress["gfw"]["error"] = f"Global Fishing Watch returned HTTP {e.code}: {detail}"
     except (OSError, ValueError) as e:
-        progress["gfw"]["error"] = f"Global Fishing Watch couldn't be reached: {e}"
+        progress["gfw"]["error"] = f"Global Fishing Watch could not be reached: {e}"
     except Exception as e:  # (an answer cut off, or not as expected: the run ends, but says why)
-        progress["gfw"]["error"] = f"Global Fishing Watch's answer couldn't be read: {type(e).__name__}: {e}"
+        progress["gfw"]["error"] = f"Global Fishing Watch response could not be read: {type(e).__name__}: {e}"
     finally:
         progress["gfw"]["running"] = False
 
@@ -167,7 +167,7 @@ def us_day(day: datetime.date, mmsis: set) -> list:
     import zstandard
 
     url = US_URL.format(year=day.year, day=day.isoformat())
-    request = urllib.request.Request(url, headers={"User-Agent": "ENC 3D"})
+    request = urllib.request.Request(url, headers={"User-Agent": "Mariner Domain Awareness"})
     rows = []
     wanted = {str(m) for m in mmsis}
     with urllib.request.urlopen(request, timeout=TIMEOUT) as res:
@@ -242,7 +242,7 @@ DK_PART = fleet.STORE.parent / "dk.part"  # the Danish zip being read: always th
 
 def dk_file(key: str, mmsis: set) -> list:
     """One of the Danish zips: downloaded, read for the fleet, deleted."""
-    request = urllib.request.Request(DK_BUCKET + urllib.parse.quote(key), headers={"User-Agent": "ENC 3D"})
+    request = urllib.request.Request(DK_BUCKET + urllib.parse.quote(key), headers={"User-Agent": "Mariner Domain Awareness"})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as res, open(DK_PART, "wb") as out:
             while chunk := res.read(1 << 20):

@@ -172,9 +172,9 @@ def fetch_catalog() -> bytes | None:
             return xml
     except urllib.error.HTTPError as e:
         if e.code != 304:
-            status["problem"] = f"NOAA answered {e.code}"
+            status["problem"] = f"NOAA chart catalogue request failed: HTTP {e.code}"
     except OSError as e:  # (URLError is one)
-        status["problem"] = f"Can't reach NOAA: {e}"
+        status["problem"] = f"NOAA could not be reached: {e}"
     return None
 
 
@@ -207,7 +207,7 @@ def take_uploads() -> None:
         try:
             mine.append(uploaded_chart(path))
         except (ValueError, DataSourceError, DataLayerError) as e:  # a damaged one mustn't cost all of NOAA's
-            status["problem"] = f"Can't read the uploaded chart {path.name}: {e}"
+            status["problem"] = f"Uploaded chart {path.name} could not be read: {e}"
     on_disk.update({c.name: c.version for c in mine})
     names = {c.name for c in mine}
     catalog = Catalog([c for c in noaa if c.name not in names] + mine)
@@ -522,7 +522,7 @@ def compile_all() -> None:
 
     run_jobs(jobs, finished)
     if failed:  # each shows up as a gap, and the viewer compiles it when asked, or says it can't
-        status["problem"] = f"{failed} of {status['total']} charts didn't compile: {error!r}"
+        status["problem"] = f"{failed} of {status['total']} charts failed to compile: {error!r}"
     if catalog.charts:  # (with no catalog to go by, everything would look old)
         for old in CACHE.glob("*.gz"):  # older versions of charts
             if old not in files and old not in land and not wanted_tile(old):
@@ -546,11 +546,11 @@ def check() -> None:
     with ThreadPoolExecutor(DOWNLOADS) as pool:
         failed = list(pool.map(fetched, stale)).count(False)
     if failed:
-        status["problem"] = f"{failed} of {len(stale)} charts didn't download; retrying at the next check"
+        status["problem"] = f"{failed} of {len(stale)} charts failed to download; retrying at next check"
     try:
         fetch_land()
     except (OSError, HTTPException) as e:
-        status["problem"] = f"Couldn't get the world's land: {e}"
+        status["problem"] = f"World land data download failed: {e}"
     compile_all()
     status.update(ready=True)
     if not COAST.exists():  # (the map has the world's coarse land till then, so it doesn't hold anything up)
@@ -558,13 +558,13 @@ def check() -> None:
         try:
             fetch_coast()
         except (OSError, HTTPException, zipfile.BadZipFile) as e:
-            status["problem"] = f"Couldn't get the world's coast: {e}"
+            status["problem"] = f"World coastline data download failed: {e}"
     if not have_sea():  # (the map works without it, so it doesn't hold anything up)
         status.update(phase="seabed", done=0, total=0)
         try:
             fetch_sea()
         except (OSError, HTTPException, zipfile.BadZipFile) as e:
-            status["problem"] = f"Couldn't get the world's seabed: {e}"
+            status["problem"] = f"World seabed data download failed: {e}"
     status.update(phase="idle", checked=time.time())
 
 
